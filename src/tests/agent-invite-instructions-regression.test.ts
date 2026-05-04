@@ -41,6 +41,9 @@ const requiredPhrases = [
   'Accept: application/json',
   'self-describing manifest',
   'x-share-token:',
+  // Handshake — explicit "Ready" so the agent doesn't start writing on its own.
+  'Reply "Ready" once you have fetched the manifest and registered presence',
+  'do not start writing into the doc on your own',
 ];
 
 for (const phrase of requiredPhrases) {

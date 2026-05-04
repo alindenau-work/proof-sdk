@@ -348,11 +348,20 @@ async function main(): Promise<void> {
         }
       }
 
-      async function loadRecentDocuments() {
+      // The dashboard polls /local/recent-documents in the background so docs that
+      // get created or deleted in another tab/process appear without a manual
+      // refresh. The first call (or a manual click on Refresh) flashes a
+      // "Loading..." status; background polls keep the list quiet so we don't
+      // strobe the status text every few seconds.
+      var lastDocumentsSignature = '';
+      async function loadRecentDocuments(options) {
+        var quiet = !!(options && options.quiet);
         var list = document.getElementById('recent-list');
         if (!list) return;
-        list.innerHTML = '';
-        setStatus('recent-status', 'Loading recent drafts...', false);
+        if (!quiet) {
+          list.innerHTML = '';
+          setStatus('recent-status', 'Loading recent drafts...', false);
+        }
         try {
           var response = await fetch('/local/recent-documents', { cache: 'no-store' });
           var data = await response.json().catch(function () { return {}; });
@@ -360,6 +369,15 @@ async function main(): Promise<void> {
             throw new Error(data.error || 'Could not load recent drafts');
           }
           var documents = Array.isArray(data.documents) ? data.documents : [];
+          // Compute a cheap signature so quiet polls only re-render when
+          // something actually changed. Avoids resetting in-flight focus on
+          // a Delete button while the user is hovering it.
+          var signature = documents.map(function (doc) {
+            return (doc.slug || '') + ':' + (doc.revision || 0) + ':' + (doc.updatedAt || '');
+          }).join('|');
+          if (quiet && signature === lastDocumentsSignature) return;
+          lastDocumentsSignature = signature;
+          list.innerHTML = '';
           if (documents.length === 0) {
             setStatus('recent-status', 'No drafts yet. Create or import one above.', false);
             return;
@@ -400,7 +418,9 @@ async function main(): Promise<void> {
             list.appendChild(item);
           });
         } catch (error) {
-          setStatus('recent-status', error.message || String(error), true);
+          if (!quiet) {
+            setStatus('recent-status', error.message || String(error), true);
+          }
         }
       }
 
@@ -436,8 +456,37 @@ async function main(): Promise<void> {
         }
       });
 
-      document.getElementById('refresh-recent').addEventListener('click', loadRecentDocuments);
+      document.getElementById('refresh-recent').addEventListener('click', function () {
+        loadRecentDocuments();
+      });
       loadRecentDocuments();
+
+      // Background poll: every 5s while the tab is visible, refresh quietly.
+      // When the tab is hidden (or the browser throttles it), we pause and do a
+      // catch-up fetch on visibilitychange so the list is correct the moment
+      // the user looks at it again.
+      var POLL_INTERVAL_MS = 5000;
+      var pollTimer = null;
+      function startPolling() {
+        if (pollTimer) return;
+        pollTimer = setInterval(function () {
+          loadRecentDocuments({ quiet: true });
+        }, POLL_INTERVAL_MS);
+      }
+      function stopPolling() {
+        if (!pollTimer) return;
+        clearInterval(pollTimer);
+        pollTimer = null;
+      }
+      document.addEventListener('visibilitychange', function () {
+        if (document.visibilityState === 'visible') {
+          loadRecentDocuments({ quiet: true });
+          startPolling();
+        } else {
+          stopPolling();
+        }
+      });
+      startPolling();
     </script>
   </body>
 </html>`);

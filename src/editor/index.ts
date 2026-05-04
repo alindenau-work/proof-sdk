@@ -5234,6 +5234,9 @@ class ProofEditorImpl implements ProofEditor {
       '- Make small, reviewable edits with a brief note on what you changed. Do not replace the whole document unless explicitly asked.',
       '- Do not edit the HandBrake repo, run migrations, touch Supabase, create branches, commit, push, open PRs, or merge unless Adam explicitly asks you to package this draft into repo work. If he does, follow the repo cadence: one issue, one role branch, one scoped PR, required checks green, no direct pushes to main, and no pulling from another agent branch.',
       '- If the Doc URL is unreachable, stop and report the exact URL. Do not silently switch to localhost unless the Doc URL itself is localhost and you are running on that same machine.',
+      '',
+      'Handshake:',
+      '- Reply "Ready" once you have fetched the manifest and registered presence. Then wait for the task — do not start writing into the doc on your own.',
     ].join('\n');
   }
 
