@@ -5203,55 +5203,37 @@ class ProofEditorImpl implements ProofEditor {
     const markdownUrl = `${origin}/api/agent/${encodedSlug}/markdown`;
     const editV2Url = `${origin}/api/agent/${encodedSlug}/edit/v2`;
 
+    // The whole point of the prompt: the LINK already self-describes the API
+    // (fetch with Accept: application/json or default headers and you get every
+    // endpoint, the auth method, the doc content, and the agent manifest). What
+    // an agent CAN'T learn from the link is the team contract — who is in the
+    // room, what role they're playing, what they must NOT touch. That's all this
+    // prompt needs to add. The verbose 6-step bootstrap was redundant noise.
+    //
+    // If you find yourself adding back step-by-step API recipes here, ask
+    // whether the link's discovery JSON already covers it. It almost always does.
+    void healthUrl; void presenceUrl; void stateUrl; void opsUrl; void markdownUrl; void editV2Url;
     return [
       'Collaborate with me on this Proof doc.',
       '',
-      'Context:',
-      '- Proof is the live drafting room for Adam, Pete, Codex, and Claude.',
-      '- HandBrake remains the canonical product repo and GitHub remains the durable change record.',
-      '- This Proof doc is collaboration state, not permission to bypass HandBrake process.',
-      '',
       `Doc: ${docUrl}`,
-      `API base: ${origin}`,
       '',
-      'Auth for each API request:',
-      `- x-share-token: ${token || '<token-from-doc-url>'}`,
-      '- X-Agent-Id: <your-agent-id>',
-      '- (Use the token from the Doc URL query param: ?token=...)',
-      '- If the Doc URL does not include a token, stop and ask Adam for a tokenized Proof link.',
+      'How to use it:',
+      '- Fetch the Doc URL with `Accept: application/json` (or no Accept header) — the response is a self-describing manifest with every endpoint, the auth recipe, and the current document content. Use that, not your assumptions.',
+      `- Auth for any API call: \`x-share-token: ${token || '<token-from-doc-url>'}\` (the token is in the Doc URL\'s ?token= query string).`,
       '',
-      'Identity requirement:',
-      '- Before your first API request, choose a unique, stable agent id for this Proof session. Do not reuse another active agent identity.',
-      '- Use that exact value in the X-Agent-Id header and in your presence body.',
-      '- Use a human-readable presence name that makes platform and role clear, for example "Codex docs reviewer" or "Claude math reviewer".',
-      '- Register that presence before making comments, suggestions, flags, or edits.',
-      '- In your original Codex/Claude chat, reply with: Agent identity: <X-Agent-Id> / <presence-name> before doing document work.',
+      'Who is in the room:',
+      '- Proof is the live drafting room for Adam, Pete, Codex, and Claude. HandBrake is the canonical product repo — Proof is collaboration state, not permission to bypass HandBrake process.',
       '',
-      'Strict rules:',
+      'Identity (do this before any document write):',
+      '- Pick a stable, unique X-Agent-Id for this session and a human-readable presence name (e.g. "Codex docs reviewer" or "Claude math reviewer").',
+      '- POST that to the presence endpoint from the manifest. Reply in the chat with: `Agent identity: <X-Agent-Id> / <presence-name>` before you start.',
+      '',
+      'Rules of the room:',
       '- Stay inside your assigned HandBrake role. If no role was assigned, act only as a reviewer/commenter in Proof.',
-      '- Use Proof for comments, suggestions, and scoped edits to this draft only.',
-      '- Do not edit the HandBrake repo, run migrations, touch Supabase, create branches, commit, push, open PRs, or merge unless Adam explicitly asks you to package this draft into repo work.',
-      '- If Adam asks you to move work into HandBrake, follow the repo cadence: one issue, one role branch, one scoped PR, required checks green, no direct pushes to main, and no pulling from another agent branch.',
-      '- Do not replace the whole document unless explicitly asked. Prefer small, reviewable edits and explain what changed.',
-      '- If the API is unreachable, stop and report the exact URL you tried. Do not silently switch to localhost unless the Doc URL itself is localhost and you are running on that same machine.',
-      '',
-      'Start here:',
-      '1) Confirm the Proof server is reachable:',
-      `   GET ${healthUrl}`,
-      '2) Read current document state with your identity headers:',
-      `   GET ${stateUrl}`,
-      '   headers: x-share-token and X-Agent-Id',
-      '3) Set your friendly name in presence before doing document work:',
-      `   POST ${presenceUrl}`,
-      '   headers: x-share-token and X-Agent-Id',
-      '   body: {"agentId":"<your-agent-id>","name":"<your-name>","status":"active"}',
-      '4) If you need to insert or append a Markdown blob, use the Markdown import endpoint first:',
-      `   POST ${markdownUrl}`,
-      '   body: {"mode":"append","markdown":"## New section\\n\\nDraft text","by":"<your-agent-id>"}',
-      '5) If comments, flags, suggestions, or surgical block edits are useful based on state, apply them with:',
-      `   POST ${opsUrl}`,
-      `   or POST ${editV2Url}`,
-      '6) Then reply briefly with what you changed, what you intentionally did not change, and any recommended next step.',
+      '- Make small, reviewable edits with a brief note on what you changed. Do not replace the whole document unless explicitly asked.',
+      '- Do not edit the HandBrake repo, run migrations, touch Supabase, create branches, commit, push, open PRs, or merge unless Adam explicitly asks you to package this draft into repo work. If he does, follow the repo cadence: one issue, one role branch, one scoped PR, required checks green, no direct pushes to main, and no pulling from another agent branch.',
+      '- If the Doc URL is unreachable, stop and report the exact URL. Do not silently switch to localhost unless the Doc URL itself is localhost and you are running on that same machine.',
     ].join('\n');
   }
 
