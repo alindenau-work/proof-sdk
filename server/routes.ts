@@ -8,6 +8,7 @@ import {
   buildCollabSession,
   getCanonicalReadableDocumentSync,
   getCollabRuntime,
+  ensureCanonicalYjsBaselineForDocument,
   invalidateCollabDocument,
   invalidateCollabDocumentAndWait,
   loadedCollabMarksMatch,
@@ -148,6 +149,112 @@ function parseJson(value: string): Record<string, unknown> {
   } catch {
     return {};
   }
+}
+
+function normalizeMarkdownLines(markdown: string): string[] {
+  const normalized = (markdown ?? '').replace(/\r\n/g, '\n');
+  if (normalized.length === 0) return [];
+  return normalized.split('\n');
+}
+
+function countCommonLines(beforeLines: string[], afterLines: string[]): number {
+  if (beforeLines.length === 0 || afterLines.length === 0) return 0;
+  if (beforeLines.length * afterLines.length > 250_000) {
+    let prefix = 0;
+    while (
+      prefix < beforeLines.length
+      && prefix < afterLines.length
+      && beforeLines[prefix] === afterLines[prefix]
+    ) {
+      prefix += 1;
+    }
+
+    let suffix = 0;
+    while (
+      suffix + prefix < beforeLines.length
+      && suffix + prefix < afterLines.length
+      && beforeLines[beforeLines.length - 1 - suffix] === afterLines[afterLines.length - 1 - suffix]
+    ) {
+      suffix += 1;
+    }
+
+    return prefix + suffix;
+  }
+  const dp: number[][] = Array.from({ length: beforeLines.length + 1 }, () => new Array(afterLines.length + 1).fill(0));
+  for (let i = beforeLines.length - 1; i >= 0; i -= 1) {
+    for (let j = afterLines.length - 1; j >= 0; j -= 1) {
+      if (beforeLines[i] === afterLines[j]) {
+        dp[i][j] = dp[i + 1][j + 1] + 1;
+      } else {
+        dp[i][j] = Math.max(dp[i + 1][j], dp[i][j + 1]);
+      }
+    }
+  }
+  return dp[0][0];
+}
+
+function summarizeMarkdownChange(
+  beforeMarkdown: string,
+  afterMarkdown: string,
+  beforeRevision: number | null | undefined,
+  afterRevision: number | null | undefined,
+): Record<string, unknown> {
+  const beforeLines = normalizeMarkdownLines(beforeMarkdown);
+  const afterLines = normalizeMarkdownLines(afterMarkdown);
+  const commonLines = countCommonLines(beforeLines, afterLines);
+  const addedLines = Math.max(0, afterLines.length - commonLines);
+  const removedLines = Math.max(0, beforeLines.length - commonLines);
+  const beforeChars = beforeMarkdown.length;
+  const afterChars = afterMarkdown.length;
+  return {
+    beforeRevision: typeof beforeRevision === 'number' ? beforeRevision : null,
+    afterRevision: typeof afterRevision === 'number' ? afterRevision : null,
+    addedLines,
+    removedLines,
+    changedLines: addedLines + removedLines,
+    beforeChars,
+    afterChars,
+    charDelta: afterChars - beforeChars,
+  };
+}
+
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map((entry) => stableJson(entry)).join(',')}]`;
+  if (!value || typeof value !== 'object') return JSON.stringify(value);
+  const sorted = Object.entries(value as Record<string, unknown>)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([key, entryValue]) => `${JSON.stringify(key)}:${stableJson(entryValue)}`);
+  return `{${sorted.join(',')}}`;
+}
+
+function summarizeMarksChange(
+  beforeMarks: Record<string, unknown>,
+  afterMarks: Record<string, unknown>,
+): Record<string, unknown> {
+  const beforeKeys = new Set(Object.keys(beforeMarks));
+  const afterKeys = new Set(Object.keys(afterMarks));
+  let added = 0;
+  let removed = 0;
+  let updated = 0;
+
+  for (const key of afterKeys) {
+    if (!beforeKeys.has(key)) {
+      added += 1;
+    } else if (stableJson(beforeMarks[key]) !== stableJson(afterMarks[key])) {
+      updated += 1;
+    }
+  }
+  for (const key of beforeKeys) {
+    if (!afterKeys.has(key)) removed += 1;
+  }
+
+  return {
+    added,
+    updated,
+    removed,
+    beforeCount: beforeKeys.size,
+    afterCount: afterKeys.size,
+  };
 }
 
 function getIdempotencyKey(req: Request): string | null {
@@ -587,7 +694,7 @@ function resolveRequestScopedCollabWsBase(req: Request): string {
   }
 
   const embeddedRaw = (process.env.COLLAB_EMBEDDED_WS || '').trim().toLowerCase();
-  const embedded = embeddedRaw === '1' || embeddedRaw === 'true' || embeddedRaw === 'yes' || embeddedRaw === 'on';
+  const embeddedEnv = embeddedRaw === '1' || embeddedRaw === 'true' || embeddedRaw === 'yes' || embeddedRaw === 'on';
 
   const publicBase = getPublicBaseUrl(req);
   if (!publicBase) return runtimeBase;
@@ -599,6 +706,16 @@ function resolveRequestScopedCollabWsBase(req: Request): string {
     }
 
     const publicUrl = new URL(publicBase);
+    // Detect the embedded runtime by comparing the runtime's WS port to the public-facing
+    // HTTP port. When they match, the collab WS is multiplexed onto /ws on the same server,
+    // so we must preserve the port. Falling back to env-flag-only detection caused loopback
+    // dev setups to advertise port+1 (split-port URLs) for an embedded runtime that was
+    // actually serving WS on the main port — clients then failed to connect.
+    const runtimePortRaw = wsUrl.port || (wsUrl.protocol === 'wss:' ? '443' : '80');
+    const publicPortRaw = publicUrl.port || (publicUrl.protocol === 'https:' ? '443' : '80');
+    const embeddedByPort = runtimePortRaw === publicPortRaw;
+    const embedded = embeddedEnv || embeddedByPort;
+
     wsUrl.protocol = publicUrl.protocol === 'https:' ? 'wss:' : 'ws:';
     wsUrl.hostname = publicUrl.hostname;
 
@@ -692,11 +809,28 @@ function getPresentedBearerToken(req: Request): string | null {
   return token.length > 0 ? token : null;
 }
 
+/**
+ * Tokenless access policy. The default ('editor') treats the slug itself as the
+ * secret — anyone who has seen the share URL can edit. That is fine for an
+ * internal tool where slugs are not enumerable, but is a footgun if the slug ever
+ * leaks (logs, browser history, screenshots).
+ *
+ * Set `PROOF_TOKENLESS_ACCESS_ROLE=viewer` to require an explicit access token
+ * for any mutation surface. Set it to `none` to deny tokenless reads entirely.
+ */
+function tokenlessDefaultRole(): ShareRole | null {
+  const raw = (process.env.PROOF_TOKENLESS_ACCESS_ROLE || '').trim().toLowerCase();
+  if (raw === 'none' || raw === 'deny' || raw === 'forbid') return null;
+  if (raw === 'viewer' || raw === 'read' || raw === 'reader') return 'viewer';
+  if (raw === 'commenter') return 'commenter';
+  if (raw === 'editor' || raw === '') return 'editor';
+  return 'editor';
+}
+
 function getAccessRole(req: Request, slug: string): ShareRole | null {
   const secret = getPresentedSecret(req);
   if (secret) return resolveDocumentAccessRole(slug, secret);
-  // Product decision: tokenless shared docs default to editable access (slug is the secret).
-  return 'editor';
+  return tokenlessDefaultRole();
 }
 
 function canOwnerMutate(req: Request, doc: { owner_secret: string | null; owner_secret_hash: string | null; owner_id: string | null }): boolean {
@@ -759,8 +893,18 @@ async function resolveOpenContextAccess(
     return null;
   }
 
-  // Tokenless links default to read-only access.
-  return { role: 'editor', tokenId: null, ownerAuthorized: false };
+  // Tokenless links: by default treat the slug as the secret and grant 'editor'
+  // (matches the legacy product decision). Operators can tighten this to 'viewer'
+  // or deny entirely via PROOF_TOKENLESS_ACCESS_ROLE; see tokenlessDefaultRole().
+  const tokenlessRole = tokenlessDefaultRole();
+  if (!tokenlessRole) {
+    res.status(401).json({
+      error: 'Share token required',
+      code: 'UNAUTHORIZED',
+    });
+    return null;
+  }
+  return { role: tokenlessRole, tokenId: null, ownerAuthorized: false };
 }
 
 function deriveShareCapabilities(role: ShareRole, shareState: string): {
@@ -784,7 +928,7 @@ function deriveShareCapabilities(role: ShareRole, shareState: string): {
 }
 
 // Create a shared document
-apiRoutes.post('/documents', (req: Request, res: Response) => {
+apiRoutes.post('/documents', async (req: Request, res: Response) => {
   const legacyCreateMode = resolveLegacyCreateMode(getPublicBaseUrl(req));
   if (legacyCreateMode === 'disabled') {
     recordLegacyCreateRouteTelemetry(req, legacyCreateMode, 'blocked_disabled');
@@ -827,6 +971,7 @@ apiRoutes.post('/documents', (req: Request, res: Response) => {
   const ownerSecret = randomUUID();
   const normalizedMarks = canonicalizeStoredMarks(marks ?? {});
   const doc = createDocument(slug, sanitizedMarkdown, normalizedMarks, title, ownerId, ownerSecret);
+  await ensureCanonicalYjsBaselineForDocument(slug);
   const defaultAccess = createDocumentAccessToken(slug, 'editor');
   const links = buildShareLink(req, doc.slug);
   const shareUrlWithToken = withShareToken(links.shareUrl, defaultAccess.secret);
@@ -1079,6 +1224,7 @@ export async function handleShareMarkdown(req: Request, res: Response): Promise<
   const slug = generateSlug();
   const ownerSecret = randomUUID();
   const doc = createDocument(slug, sanitizedMarkdown, marks, title, ownerId, ownerSecret);
+  await ensureCanonicalYjsBaselineForDocument(slug);
   const access = createDocumentAccessToken(slug, requestedRole);
   const links = buildShareLink(req, doc.slug);
   const shareUrlWithToken = withShareToken(links.shareUrl, access.secret);
@@ -1274,7 +1420,11 @@ apiRoutes.put('/documents/:slug/title', (req: Request, res: Response) => {
     updatedAt: updatedDoc.updated_at,
     actor: actor || 'anonymous',
   }, clientId);
-  addEvent(slug, 'document.title.updated', { actor }, actor || 'anonymous');
+  addEvent(slug, 'document.title.updated', {
+    actor,
+    before: doc.title,
+    after: updatedDoc.title,
+  }, actor || 'anonymous');
 
   refreshSnapshotForSlug(slug);
 
@@ -1530,9 +1680,25 @@ apiRoutes.put('/documents/:slug', async (req: Request, res: Response) => {
   }
 
   // Broadcast only after collab propagation attempt so listeners don't race stale runtime state.
+  const updatedMarks = parseJson(updatedDoc.marks);
+  const changeSummary: Record<string, unknown> = {
+    content: hasMarkdownUpdate
+      ? summarizeMarkdownChange(currentDoc.markdown, updatedDoc.markdown, currentDoc.revision, updatedDoc.revision)
+      : null,
+    marks: hasMarksUpdate && previousMarks
+      ? summarizeMarksChange(previousMarks, updatedMarks)
+      : null,
+    title: hasTitleUpdate
+      ? {
+          before: currentDoc.title,
+          after: updatedDoc.title,
+        }
+      : null,
+  };
   const commentEvents = (hasMarksUpdate && previousMarks)
-    ? collectCommentEventsFromMarksDiff(previousMarks, parseJson(updatedDoc.marks), mutationActor)
+    ? collectCommentEventsFromMarksDiff(previousMarks, updatedMarks, mutationActor)
     : [];
+  payload.changes = changeSummary;
   broadcastToRoom(slug, payload, clientId);
   for (const event of commentEvents) {
     addDocumentEvent(slug, event.type, event.data, event.actor);
@@ -1544,6 +1710,7 @@ apiRoutes.put('/documents/:slug', async (req: Request, res: Response) => {
       revision: updatedDoc.revision,
       ...integrity,
     },
+    changes: changeSummary,
   }, mutationActor);
   if (integrity.repeatedHeadings.length > 0) {
     console.warn('[document.updated.integrity_warning]', {

@@ -39,17 +39,123 @@ import { isHostedRewriteEnvironment } from './rewrite-policy.js';
 import { getActiveCollabClientBreakdown } from './ws.js';
 import { canonicalizeStoredMarks, type StoredMark } from '../src/formats/marks.js';
 import { refreshSnapshotForSlug } from './snapshot.js';
+import {
+  AGENT_EDIT_V2_MAX_BLOCKS_PER_MUTATION,
+  AGENT_EDIT_V2_MAX_BYTES_PER_BLOCK,
+  AGENT_EDIT_V2_MAX_OPERATIONS,
+} from './agent-edit-limits.js';
 
 export type AgentEditV2Result = {
   status: number;
   body: Record<string, unknown>;
 };
 
+/**
+ * Read the `canonical_required` opt-in from an agent edit body.
+ *
+ * When set, divergence between the canonical store and live Yjs (i.e.
+ * `collab.status !== 'confirmed'`) returns HTTP 409 + `LIVE_COLLAB_DIVERGED`
+ * instead of the soft-fail 202. Agents that report success to humans should
+ * pass this; agents doing best-effort fire-and-forget edits can omit it.
+ */
+export function readCanonicalRequired(body: unknown): boolean {
+  if (!body || typeof body !== 'object') return false;
+  const raw = (body as Record<string, unknown>).canonical_required ?? (body as Record<string, unknown>).canonicalRequired;
+  return raw === true || raw === 'true';
+}
+
+/**
+ * Shape an `applyAgentEditV2`-flavoured response body so that:
+ *   - `success` reflects whether the write actually landed in the live Yjs state.
+ *   - `collabApplied` is hoisted to the top level (not buried in `collab.status`).
+ *   - When divergence happened, the body always carries `code: 'LIVE_COLLAB_DIVERGED'`
+ *     so agents can branch on the body alone (no HTTP-status interpretation needed).
+ *
+ * Status-code policy:
+ *   - converged:                                                    → keep caller status (200)
+ *   - diverged AND `canonical_required === true` (opt-in hard fail) → 409
+ *   - diverged AND `canonical_required` not set (default soft fail) → 202
+ *
+ * The 202 default preserves backward compat for agents that only check HTTP
+ * status — the body now correctly says `success: false`, but the status code
+ * stays in the same 2xx family.
+ */
+export function applyDivergenceShape<T extends { status: number; body: Record<string, unknown> }>(
+  result: T,
+  options: {
+    confirmed: boolean;
+    canonicalRequired: boolean;
+    /**
+     * The reason returned by the convergence layer. Used for logging hints; does NOT
+     * change the user-facing `code` (which is always `LIVE_COLLAB_DIVERGED` when not
+     * confirmed) so agent error-handling stays a single branch.
+     */
+    reason?: string | null;
+  },
+): T {
+  const { confirmed, canonicalRequired, reason } = options;
+  if (confirmed) {
+    result.body = {
+      ...result.body,
+      success: true,
+      collabApplied: true,
+    };
+    return result;
+  }
+
+  result.status = canonicalRequired ? 409 : 202;
+  result.body = {
+    ...result.body,
+    success: false,
+    collabApplied: false,
+    code: 'LIVE_COLLAB_DIVERGED',
+    error: 'The agent write reached the canonical document store but the live Yjs state did not converge before another writer changed the document. Re-anchor against the latest snapshot and retry.',
+    ...(reason ? { divergenceReason: reason } : {}),
+    ...(canonicalRequired ? {} : { hint: 'Pass `canonical_required: true` to fail-fast on this race instead of receiving HTTP 202.' }),
+  };
+  return result;
+}
+
+/**
+ * Emit `agent.edit.superseded` so polling agents can detect that a prior
+ * accepted write was lost to a live-collab race without diffing markdown.
+ */
+export function emitAgentEditSupersededEvent(
+  slug: string,
+  by: string,
+  details: {
+    reason: string | null;
+    canonicalRequired: boolean;
+    expectedMarkdownHead?: string;
+    expectedMarkdownHash?: string;
+  },
+): void {
+  try {
+    addDocumentEvent(
+      slug,
+      'agent.edit.superseded',
+      {
+        by,
+        reason: details.reason ?? 'sync_timeout',
+        canonicalRequired: details.canonicalRequired,
+        ...(details.expectedMarkdownHead ? { expectedMarkdownHead: details.expectedMarkdownHead } : {}),
+        ...(details.expectedMarkdownHash ? { expectedMarkdownHash: details.expectedMarkdownHash } : {}),
+      },
+      by,
+    );
+  } catch (error) {
+    // Event emission is best-effort — never break the primary mutation path.
+    console.warn('[agent-edit-v2] Failed to emit agent.edit.superseded event', { slug, error });
+  }
+}
+
 type ReplaceBlockOp = { op: 'replace_block'; ref: string; block: { markdown: string } };
 
 type InsertAfterOp = { op: 'insert_after'; ref: string; blocks: Array<{ markdown: string }> };
 
 type InsertBeforeOp = { op: 'insert_before'; ref: string; blocks: Array<{ markdown: string }> };
+
+type AppendBlocksOp = { op: 'append'; blocks: Array<{ markdown: string }> };
 
 type DeleteBlockOp = { op: 'delete_block'; ref: string };
 
@@ -72,9 +178,30 @@ type AgentEditV2Operation =
   | ReplaceBlockOp
   | InsertAfterOp
   | InsertBeforeOp
+  | AppendBlocksOp
   | DeleteBlockOp
   | ReplaceRangeOp
   | FindReplaceOp;
+
+type OperationPayloadError = {
+  error: string;
+  opIndex: number;
+  path?: string;
+  expected?: string;
+  actual?: string;
+  hint?: string;
+};
+
+type OperationApplyError = {
+  ok: false;
+  code: string;
+  message: string;
+  opIndex: number;
+  path?: string;
+  expected?: string;
+  actual?: string;
+  hint?: string;
+};
 
 type BlockState = {
   id: string;
@@ -113,6 +240,16 @@ type ReferencedSnapshotRef = {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function describeType(value: unknown): string {
+  if (value === null) return 'null';
+  if (Array.isArray(value)) return 'array';
+  return typeof value;
+}
+
+function operationPath(opIndex: number, suffix?: string): string {
+  return `operations[${opIndex}]${suffix ? `.${suffix}` : ''}`;
 }
 
 function parsePositiveInt(value: string | undefined, fallback: number): number {
@@ -252,13 +389,22 @@ function replaceFirst(source: string, find: string, replace: string): string | n
 async function parseSingleBlockMarkdown(
   parser: HeadlessMilkdownParser,
   markdown: string,
-): Promise<{ node: ProseMirrorNode } | { error: string }> {
+): Promise<{ node: ProseMirrorNode } | { error: string; expected?: string; actual?: string; hint?: string }> {
   const parsed = parseMarkdownWithHtmlFallback(parser, markdown ?? '');
   if (!parsed.doc) {
     return { error: summarizeParseError(parsed.error) };
   }
   if (parsed.doc.childCount !== 1) {
-    return { error: 'Expected block markdown to parse into a single top-level node' };
+    const nodeTypes: string[] = [];
+    for (let i = 0; i < parsed.doc.childCount; i += 1) {
+      nodeTypes.push(parsed.doc.child(i).type.name);
+    }
+    return {
+      error: 'Expected block markdown to parse into a single top-level node',
+      expected: 'one top-level Markdown node',
+      actual: `${parsed.doc.childCount} top-level nodes${nodeTypes.length ? ` (${nodeTypes.join(', ')})` : ''}`,
+      hint: 'Use /markdown for multi-block Markdown, or split this operation into one block per top-level node.',
+    };
   }
   return { node: parsed.doc.child(0) };
 }
@@ -278,20 +424,50 @@ async function buildSnapshot(slug: string): Promise<Record<string, unknown> | nu
 
 function normalizeOperations(
   raw: unknown[],
-): { operations: AgentEditV2Operation[]; insertCount: number } | { error: string; opIndex: number } {
+): { operations: AgentEditV2Operation[]; insertCount: number } | OperationPayloadError {
   const operations: AgentEditV2Operation[] = [];
   let insertCount = 0;
 
   for (let i = 0; i < raw.length; i += 1) {
     const op = raw[i];
     if (!isRecord(op) || typeof op.op !== 'string') {
-      return { error: 'Invalid operation payload', opIndex: i };
+      return {
+        error: 'Invalid operation payload',
+        opIndex: i,
+        path: operationPath(i),
+        expected: 'object with string op',
+        actual: describeType(op),
+      };
     }
 
     const kind = op.op;
     if (kind === 'replace_block') {
-      if (typeof op.ref !== 'string' || !isRecord(op.block) || typeof op.block.markdown !== 'string') {
-        return { error: 'replace_block requires ref + block.markdown', opIndex: i };
+      if (typeof op.ref !== 'string') {
+        return {
+          error: 'replace_block.ref must be a string',
+          opIndex: i,
+          path: operationPath(i, 'ref'),
+          expected: 'string',
+          actual: describeType(op.ref),
+        };
+      }
+      if (!isRecord(op.block)) {
+        return {
+          error: 'replace_block.block must be an object',
+          opIndex: i,
+          path: operationPath(i, 'block'),
+          expected: 'object with markdown string',
+          actual: describeType(op.block),
+        };
+      }
+      if (typeof op.block.markdown !== 'string') {
+        return {
+          error: `replace_block.block.markdown must be a string, got ${describeType(op.block.markdown)}`,
+          opIndex: i,
+          path: operationPath(i, 'block.markdown'),
+          expected: 'string',
+          actual: describeType(op.block.markdown),
+        };
       }
       operations.push({ op: 'replace_block', ref: op.ref, block: { markdown: op.block.markdown } });
       insertCount += 1;
@@ -299,11 +475,26 @@ function normalizeOperations(
     }
     if (kind === 'insert_after') {
       if (typeof op.ref !== 'string' || !Array.isArray(op.blocks)) {
-        return { error: 'insert_after requires ref + blocks', opIndex: i };
+        return {
+          error: 'insert_after requires ref + blocks',
+          opIndex: i,
+          path: typeof op.ref !== 'string' ? operationPath(i, 'ref') : operationPath(i, 'blocks'),
+          expected: typeof op.ref !== 'string' ? 'string' : 'array',
+          actual: typeof op.ref !== 'string' ? describeType(op.ref) : describeType(op.blocks),
+        };
       }
       const blocks = op.blocks.map((block) => (isRecord(block) ? block.markdown : null));
-      if (blocks.some((markdown) => typeof markdown !== 'string')) {
-        return { error: 'insert_after blocks must include markdown', opIndex: i };
+      const badBlockIndex = blocks.findIndex((markdown) => typeof markdown !== 'string');
+      if (badBlockIndex >= 0) {
+        const badBlock = op.blocks[badBlockIndex];
+        const badMarkdown = isRecord(badBlock) ? badBlock.markdown : badBlock;
+        return {
+          error: `insert_after blocks[${badBlockIndex}].markdown must be a string, got ${describeType(badMarkdown)}`,
+          opIndex: i,
+          path: operationPath(i, `blocks[${badBlockIndex}].markdown`),
+          expected: 'string',
+          actual: describeType(badMarkdown),
+        };
       }
       operations.push({
         op: 'insert_after',
@@ -315,11 +506,26 @@ function normalizeOperations(
     }
     if (kind === 'insert_before') {
       if (typeof op.ref !== 'string' || !Array.isArray(op.blocks)) {
-        return { error: 'insert_before requires ref + blocks', opIndex: i };
+        return {
+          error: 'insert_before requires ref + blocks',
+          opIndex: i,
+          path: typeof op.ref !== 'string' ? operationPath(i, 'ref') : operationPath(i, 'blocks'),
+          expected: typeof op.ref !== 'string' ? 'string' : 'array',
+          actual: typeof op.ref !== 'string' ? describeType(op.ref) : describeType(op.blocks),
+        };
       }
       const blocks = op.blocks.map((block) => (isRecord(block) ? block.markdown : null));
-      if (blocks.some((markdown) => typeof markdown !== 'string')) {
-        return { error: 'insert_before blocks must include markdown', opIndex: i };
+      const badBlockIndex = blocks.findIndex((markdown) => typeof markdown !== 'string');
+      if (badBlockIndex >= 0) {
+        const badBlock = op.blocks[badBlockIndex];
+        const badMarkdown = isRecord(badBlock) ? badBlock.markdown : badBlock;
+        return {
+          error: `insert_before blocks[${badBlockIndex}].markdown must be a string, got ${describeType(badMarkdown)}`,
+          opIndex: i,
+          path: operationPath(i, `blocks[${badBlockIndex}].markdown`),
+          expected: 'string',
+          actual: describeType(badMarkdown),
+        };
       }
       operations.push({
         op: 'insert_before',
@@ -329,20 +535,79 @@ function normalizeOperations(
       insertCount += blocks.length;
       continue;
     }
+    if (kind === 'append') {
+      if (!Array.isArray(op.blocks)) {
+        return {
+          error: 'append requires blocks',
+          opIndex: i,
+          path: operationPath(i, 'blocks'),
+          expected: 'array',
+          actual: describeType(op.blocks),
+        };
+      }
+      const blocks = op.blocks.map((block) => (isRecord(block) ? block.markdown : null));
+      const badBlockIndex = blocks.findIndex((markdown) => typeof markdown !== 'string');
+      if (badBlockIndex >= 0) {
+        const badBlock = op.blocks[badBlockIndex];
+        const badMarkdown = isRecord(badBlock) ? badBlock.markdown : badBlock;
+        return {
+          error: `append blocks[${badBlockIndex}].markdown must be a string, got ${describeType(badMarkdown)}`,
+          opIndex: i,
+          path: operationPath(i, `blocks[${badBlockIndex}].markdown`),
+          expected: 'string',
+          actual: describeType(badMarkdown),
+        };
+      }
+      operations.push({
+        op: 'append',
+        blocks: blocks.map((markdown) => ({ markdown: markdown as string })),
+      });
+      insertCount += blocks.length;
+      continue;
+    }
     if (kind === 'delete_block') {
       if (typeof op.ref !== 'string') {
-        return { error: 'delete_block requires ref', opIndex: i };
+        return {
+          error: 'delete_block.ref must be a string',
+          opIndex: i,
+          path: operationPath(i, 'ref'),
+          expected: 'string',
+          actual: describeType(op.ref),
+        };
       }
       operations.push({ op: 'delete_block', ref: op.ref });
       continue;
     }
     if (kind === 'replace_range') {
       if (typeof op.fromRef !== 'string' || typeof op.toRef !== 'string' || !Array.isArray(op.blocks)) {
-        return { error: 'replace_range requires fromRef + toRef + blocks', opIndex: i };
+        return {
+          error: 'replace_range requires fromRef + toRef + blocks',
+          opIndex: i,
+          path: typeof op.fromRef !== 'string'
+            ? operationPath(i, 'fromRef')
+            : typeof op.toRef !== 'string'
+              ? operationPath(i, 'toRef')
+              : operationPath(i, 'blocks'),
+          expected: typeof op.fromRef !== 'string' || typeof op.toRef !== 'string' ? 'string' : 'array',
+          actual: typeof op.fromRef !== 'string'
+            ? describeType(op.fromRef)
+            : typeof op.toRef !== 'string'
+              ? describeType(op.toRef)
+              : describeType(op.blocks),
+        };
       }
       const blocks = op.blocks.map((block) => (isRecord(block) ? block.markdown : null));
-      if (blocks.some((markdown) => typeof markdown !== 'string')) {
-        return { error: 'replace_range blocks must include markdown', opIndex: i };
+      const badBlockIndex = blocks.findIndex((markdown) => typeof markdown !== 'string');
+      if (badBlockIndex >= 0) {
+        const badBlock = op.blocks[badBlockIndex];
+        const badMarkdown = isRecord(badBlock) ? badBlock.markdown : badBlock;
+        return {
+          error: `replace_range blocks[${badBlockIndex}].markdown must be a string, got ${describeType(badMarkdown)}`,
+          opIndex: i,
+          path: operationPath(i, `blocks[${badBlockIndex}].markdown`),
+          expected: 'string',
+          actual: describeType(badMarkdown),
+        };
       }
       operations.push({
         op: 'replace_range',
@@ -355,11 +620,31 @@ function normalizeOperations(
     }
     if (kind === 'find_replace_in_block') {
       if (typeof op.ref !== 'string' || typeof op.find !== 'string' || typeof op.replace !== 'string') {
-        return { error: 'find_replace_in_block requires ref + find + replace', opIndex: i };
+        return {
+          error: 'find_replace_in_block requires ref + find + replace',
+          opIndex: i,
+          path: typeof op.ref !== 'string'
+            ? operationPath(i, 'ref')
+            : typeof op.find !== 'string'
+              ? operationPath(i, 'find')
+              : operationPath(i, 'replace'),
+          expected: 'string',
+          actual: typeof op.ref !== 'string'
+            ? describeType(op.ref)
+            : typeof op.find !== 'string'
+              ? describeType(op.find)
+              : describeType(op.replace),
+        };
       }
       const occurrence = typeof op.occurrence === 'string' ? op.occurrence : 'first';
       if (occurrence !== 'first' && occurrence !== 'all') {
-        return { error: 'find_replace_in_block occurrence must be first or all', opIndex: i };
+        return {
+          error: 'find_replace_in_block occurrence must be first or all',
+          opIndex: i,
+          path: operationPath(i, 'occurrence'),
+          expected: 'first or all',
+          actual: String(occurrence),
+        };
       }
       operations.push({
         op: 'find_replace_in_block',
@@ -371,7 +656,13 @@ function normalizeOperations(
       continue;
     }
 
-    return { error: `Unknown op: ${JSON.stringify(kind)}`, opIndex: i };
+    return {
+      error: `Unknown op: ${JSON.stringify(kind)}`,
+      opIndex: i,
+      path: operationPath(i, 'op'),
+      expected: 'replace_block, insert_after, insert_before, append, delete_block, replace_range, or find_replace_in_block',
+      actual: JSON.stringify(kind),
+    };
   }
 
   return { operations, insertCount };
@@ -382,17 +673,26 @@ async function applyOperations(
   blocks: BlockState[],
   operations: AgentEditV2Operation[],
   nextRevision: number,
-): Promise<{ ok: true; blocks: BlockState[] } | { ok: false; code: string; message: string; opIndex: number } > {
+): Promise<{ ok: true; blocks: BlockState[] } | OperationApplyError > {
   for (let opIndex = 0; opIndex < operations.length; opIndex += 1) {
     const op = operations[opIndex];
     if (op.op === 'replace_block') {
       const idx = parseRef(op.ref);
       if (idx === null || idx < 0 || idx >= blocks.length) {
-        return { ok: false, code: 'INVALID_REF', message: 'Invalid ref', opIndex };
+        return { ok: false, code: 'INVALID_REF', message: 'Invalid ref', opIndex, path: operationPath(opIndex, 'ref') };
       }
       const parsed = await parseSingleBlockMarkdown(parser, op.block.markdown);
       if ('error' in parsed) {
-        return { ok: false, code: 'INVALID_BLOCK_MARKDOWN', message: parsed.error, opIndex };
+        return {
+          ok: false,
+          code: 'INVALID_BLOCK_MARKDOWN',
+          message: parsed.error,
+          opIndex,
+          path: operationPath(opIndex, 'block.markdown'),
+          expected: parsed.expected,
+          actual: parsed.actual,
+          hint: parsed.hint,
+        };
       }
       blocks.splice(idx, 1, { id: randomUUID(), createdRevision: nextRevision, node: parsed.node });
       continue;
@@ -401,13 +701,23 @@ async function applyOperations(
     if (op.op === 'insert_after') {
       const idx = parseRef(op.ref);
       if (idx === null || idx < 0 || idx >= blocks.length) {
-        return { ok: false, code: 'INVALID_REF', message: 'Invalid ref', opIndex };
+        return { ok: false, code: 'INVALID_REF', message: 'Invalid ref', opIndex, path: operationPath(opIndex, 'ref') };
       }
       const inserts: BlockState[] = [];
-      for (const block of op.blocks) {
+      for (let blockIndex = 0; blockIndex < op.blocks.length; blockIndex += 1) {
+        const block = op.blocks[blockIndex];
         const parsed = await parseSingleBlockMarkdown(parser, block.markdown);
         if ('error' in parsed) {
-          return { ok: false, code: 'INVALID_BLOCK_MARKDOWN', message: parsed.error, opIndex };
+          return {
+            ok: false,
+            code: 'INVALID_BLOCK_MARKDOWN',
+            message: parsed.error,
+            opIndex,
+            path: operationPath(opIndex, `blocks[${blockIndex}].markdown`),
+            expected: parsed.expected,
+            actual: parsed.actual,
+            hint: parsed.hint,
+          };
         }
         inserts.push({ id: randomUUID(), createdRevision: nextRevision, node: parsed.node });
       }
@@ -418,13 +728,23 @@ async function applyOperations(
     if (op.op === 'insert_before') {
       const idx = parseRef(op.ref);
       if (idx === null || idx < 0 || idx >= blocks.length) {
-        return { ok: false, code: 'INVALID_REF', message: 'Invalid ref', opIndex };
+        return { ok: false, code: 'INVALID_REF', message: 'Invalid ref', opIndex, path: operationPath(opIndex, 'ref') };
       }
       const inserts: BlockState[] = [];
-      for (const block of op.blocks) {
+      for (let blockIndex = 0; blockIndex < op.blocks.length; blockIndex += 1) {
+        const block = op.blocks[blockIndex];
         const parsed = await parseSingleBlockMarkdown(parser, block.markdown);
         if ('error' in parsed) {
-          return { ok: false, code: 'INVALID_BLOCK_MARKDOWN', message: parsed.error, opIndex };
+          return {
+            ok: false,
+            code: 'INVALID_BLOCK_MARKDOWN',
+            message: parsed.error,
+            opIndex,
+            path: operationPath(opIndex, `blocks[${blockIndex}].markdown`),
+            expected: parsed.expected,
+            actual: parsed.actual,
+            hint: parsed.hint,
+          };
         }
         inserts.push({ id: randomUUID(), createdRevision: nextRevision, node: parsed.node });
       }
@@ -432,10 +752,33 @@ async function applyOperations(
       continue;
     }
 
+    if (op.op === 'append') {
+      const inserts: BlockState[] = [];
+      for (let blockIndex = 0; blockIndex < op.blocks.length; blockIndex += 1) {
+        const block = op.blocks[blockIndex];
+        const parsed = await parseSingleBlockMarkdown(parser, block.markdown);
+        if ('error' in parsed) {
+          return {
+            ok: false,
+            code: 'INVALID_BLOCK_MARKDOWN',
+            message: parsed.error,
+            opIndex,
+            path: operationPath(opIndex, `blocks[${blockIndex}].markdown`),
+            expected: parsed.expected,
+            actual: parsed.actual,
+            hint: parsed.hint,
+          };
+        }
+        inserts.push({ id: randomUUID(), createdRevision: nextRevision, node: parsed.node });
+      }
+      blocks.splice(blocks.length, 0, ...inserts);
+      continue;
+    }
+
     if (op.op === 'delete_block') {
       const idx = parseRef(op.ref);
       if (idx === null || idx < 0 || idx >= blocks.length) {
-        return { ok: false, code: 'INVALID_REF', message: 'Invalid ref', opIndex };
+        return { ok: false, code: 'INVALID_REF', message: 'Invalid ref', opIndex, path: operationPath(opIndex, 'ref') };
       }
       blocks.splice(idx, 1);
       continue;
@@ -445,16 +788,26 @@ async function applyOperations(
       const fromIdx = parseRef(op.fromRef);
       const toIdx = parseRef(op.toRef);
       if (fromIdx === null || toIdx === null || fromIdx < 0 || toIdx < 0 || fromIdx >= blocks.length || toIdx >= blocks.length) {
-        return { ok: false, code: 'INVALID_REF', message: 'Invalid range ref', opIndex };
+        return { ok: false, code: 'INVALID_REF', message: 'Invalid range ref', opIndex, path: operationPath(opIndex, fromIdx === null ? 'fromRef' : 'toRef') };
       }
       if (fromIdx > toIdx) {
-        return { ok: false, code: 'INVALID_RANGE', message: 'fromRef must be before toRef', opIndex };
+        return { ok: false, code: 'INVALID_RANGE', message: 'fromRef must be before toRef', opIndex, path: operationPath(opIndex, 'fromRef') };
       }
       const inserts: BlockState[] = [];
-      for (const block of op.blocks) {
+      for (let blockIndex = 0; blockIndex < op.blocks.length; blockIndex += 1) {
+        const block = op.blocks[blockIndex];
         const parsed = await parseSingleBlockMarkdown(parser, block.markdown);
         if ('error' in parsed) {
-          return { ok: false, code: 'INVALID_BLOCK_MARKDOWN', message: parsed.error, opIndex };
+          return {
+            ok: false,
+            code: 'INVALID_BLOCK_MARKDOWN',
+            message: parsed.error,
+            opIndex,
+            path: operationPath(opIndex, `blocks[${blockIndex}].markdown`),
+            expected: parsed.expected,
+            actual: parsed.actual,
+            hint: parsed.hint,
+          };
         }
         inserts.push({ id: randomUUID(), createdRevision: nextRevision, node: parsed.node });
       }
@@ -464,29 +817,38 @@ async function applyOperations(
 
     if (op.op === 'find_replace_in_block') {
       if (!op.find) {
-        return { ok: false, code: 'INVALID_OPERATIONS', message: 'find must be non-empty', opIndex };
+        return { ok: false, code: 'INVALID_OPERATIONS', message: 'find must be non-empty', opIndex, path: operationPath(opIndex, 'find') };
       }
       const idx = parseRef(op.ref);
       if (idx === null || idx < 0 || idx >= blocks.length) {
-        return { ok: false, code: 'INVALID_REF', message: 'Invalid ref', opIndex };
+        return { ok: false, code: 'INVALID_REF', message: 'Invalid ref', opIndex, path: operationPath(opIndex, 'ref') };
       }
       const current = blocks[idx];
       const markdown = await serializeSingleNode(current.node);
       let replaced: string | null = null;
       if (op.occurrence === 'all') {
         if (!markdown.includes(op.find)) {
-          return { ok: false, code: 'FIND_TARGET_NOT_FOUND', message: 'find target not found', opIndex };
+          return { ok: false, code: 'FIND_TARGET_NOT_FOUND', message: 'find target not found', opIndex, path: operationPath(opIndex, 'find') };
         }
         replaced = markdown.split(op.find).join(op.replace);
       } else {
         replaced = replaceFirst(markdown, op.find, op.replace);
         if (replaced === null) {
-          return { ok: false, code: 'FIND_TARGET_NOT_FOUND', message: 'find target not found', opIndex };
+          return { ok: false, code: 'FIND_TARGET_NOT_FOUND', message: 'find target not found', opIndex, path: operationPath(opIndex, 'find') };
         }
       }
       const parsed = await parseSingleBlockMarkdown(parser, replaced);
       if ('error' in parsed) {
-        return { ok: false, code: 'INVALID_BLOCK_MARKDOWN', message: parsed.error, opIndex };
+        return {
+          ok: false,
+          code: 'INVALID_BLOCK_MARKDOWN',
+          message: parsed.error,
+          opIndex,
+          path: operationPath(opIndex, 'replace'),
+          expected: parsed.expected,
+          actual: parsed.actual,
+          hint: parsed.hint,
+        };
       }
       blocks.splice(idx, 1, { ...current, node: parsed.node });
       continue;
@@ -556,6 +918,7 @@ async function finalizeAgentEditV2Response(
   markdown: string,
   marks: Record<string, unknown>,
   revision: number,
+  canonicalRequired: boolean = false,
 ): Promise<AgentEditV2Result> {
   const activeCollabClients = await getStrictLiveClientCountWithGrace(slug);
   const finalizeVerification = async (
@@ -679,12 +1042,9 @@ async function finalizeAgentEditV2Response(
   }
 
   const snapshot = await buildSnapshot(slug);
-  const status = collabResult.confirmed ? 200 : 202;
-
-  return {
-    status,
+  const result: AgentEditV2Result = {
+    status: 200,
     body: {
-      success: true,
       slug,
       revision,
       collab: {
@@ -695,6 +1055,20 @@ async function finalizeAgentEditV2Response(
       snapshot,
     },
   };
+  applyDivergenceShape(result, {
+    confirmed: collabResult.confirmed,
+    canonicalRequired,
+    reason: collabResult.reason ?? null,
+  });
+  if (!collabResult.confirmed) {
+    emitAgentEditSupersededEvent(slug, by, {
+      reason: collabResult.reason ?? null,
+      canonicalRequired,
+      expectedMarkdownHead: markdown.slice(0, 200),
+      expectedMarkdownHash: createHash('sha256').update(markdown, 'utf8').digest('hex').slice(0, 16),
+    });
+  }
+  return result;
 }
 export async function applyAgentEditV2(
   slug: string,
@@ -712,6 +1086,7 @@ export async function applyAgentEditV2(
     : null;
   const baseRevision = typeof payload.baseRevision === 'number' ? payload.baseRevision : null;
   const by = typeof payload.by === 'string' && payload.by.trim() ? payload.by.trim() : 'ai:unknown';
+  const canonicalRequired = readCanonicalRequired(payload);
 
   if (baseToken && baseRevision !== null) {
     return {
@@ -743,35 +1118,83 @@ export async function applyAgentEditV2(
   if (operationsRaw.length === 0) {
     return { status: 400, body: { success: false, code: 'INVALID_OPERATIONS', error: 'operations must be a non-empty array' } };
   }
-  if (operationsRaw.length > 100) {
-    return { status: 400, body: { success: false, code: 'OP_LIMIT_EXCEEDED', error: 'Too many operations' } };
+  if (operationsRaw.length > AGENT_EDIT_V2_MAX_OPERATIONS) {
+    return {
+      status: 400,
+      body: {
+        success: false,
+        code: 'OP_LIMIT_EXCEEDED',
+        error: 'Too many operations',
+        limit: AGENT_EDIT_V2_MAX_OPERATIONS,
+      },
+    };
   }
 
   const normalized = normalizeOperations(operationsRaw as unknown[]);
   if ('error' in normalized) {
     return {
       status: 400,
-      body: { success: false, code: 'INVALID_OPERATIONS', error: normalized.error, opIndex: normalized.opIndex },
+      body: {
+        success: false,
+        code: 'INVALID_OPERATIONS',
+        error: normalized.error,
+        opIndex: normalized.opIndex,
+        ...(normalized.path ? { path: normalized.path } : {}),
+        ...(normalized.expected ? { expected: normalized.expected } : {}),
+        ...(normalized.actual ? { actual: normalized.actual } : {}),
+        ...(normalized.hint ? { hint: normalized.hint } : {}),
+      },
     };
   }
 
-  if (normalized.insertCount > 500) {
-    return { status: 400, body: { success: false, code: 'REQUEST_TOO_LARGE', error: 'Too many blocks inserted' } };
+  if (normalized.insertCount > AGENT_EDIT_V2_MAX_BLOCKS_PER_MUTATION) {
+    return {
+      status: 400,
+      body: {
+        success: false,
+        code: 'REQUEST_TOO_LARGE',
+        error: 'Too many blocks inserted',
+        limit: AGENT_EDIT_V2_MAX_BLOCKS_PER_MUTATION,
+      },
+    };
   }
 
   for (let i = 0; i < normalized.operations.length; i += 1) {
     const op = normalized.operations[i];
     if (op.op === 'replace_block') {
       const bytes = Buffer.byteLength(op.block.markdown ?? '', 'utf8');
-      if (bytes > 50_000) {
-        return { status: 400, body: { success: false, code: 'REQUEST_TOO_LARGE', error: 'Block markdown too large', opIndex: i } };
+      if (bytes > AGENT_EDIT_V2_MAX_BYTES_PER_BLOCK) {
+        return {
+          status: 400,
+          body: {
+            success: false,
+            code: 'REQUEST_TOO_LARGE',
+            error: 'Block markdown too large',
+            opIndex: i,
+            path: operationPath(i, 'block.markdown'),
+            limit: AGENT_EDIT_V2_MAX_BYTES_PER_BLOCK,
+            actualBytes: bytes,
+          },
+        };
       }
     }
-    if (op.op === 'insert_after' || op.op === 'insert_before' || op.op === 'replace_range') {
-      for (const block of op.blocks) {
+    if (op.op === 'insert_after' || op.op === 'insert_before' || op.op === 'append' || op.op === 'replace_range') {
+      for (let blockIndex = 0; blockIndex < op.blocks.length; blockIndex += 1) {
+        const block = op.blocks[blockIndex];
         const bytes = Buffer.byteLength(block.markdown ?? '', 'utf8');
-        if (bytes > 50_000) {
-          return { status: 400, body: { success: false, code: 'REQUEST_TOO_LARGE', error: 'Block markdown too large', opIndex: i } };
+        if (bytes > AGENT_EDIT_V2_MAX_BYTES_PER_BLOCK) {
+          return {
+            status: 400,
+            body: {
+              success: false,
+              code: 'REQUEST_TOO_LARGE',
+              error: 'Block markdown too large',
+              opIndex: i,
+              path: operationPath(i, `blocks[${blockIndex}].markdown`),
+              limit: AGENT_EDIT_V2_MAX_BYTES_PER_BLOCK,
+              actualBytes: bytes,
+            },
+          };
         }
       }
     }
@@ -944,6 +1367,10 @@ export async function applyAgentEditV2(
         code: applied.code,
         error: applied.message,
         opIndex: applied.opIndex,
+        ...(applied.path ? { path: applied.path } : {}),
+        ...(applied.expected ? { expected: applied.expected } : {}),
+        ...(applied.actual ? { actual: applied.actual } : {}),
+        ...(applied.hint ? { hint: applied.hint } : {}),
         ...(snapshot ? { snapshot } : {}),
       },
     };
@@ -967,7 +1394,7 @@ export async function applyAgentEditV2(
   const marks = authoritativeMarks;
   const singleWriterMode = isSingleWriterEditEnabled();
   if (nextMarkdown === authoritativeMarkdown) {
-    return finalizeAgentEditV2Response(slug, by, authoritativeMarkdown, marks, doc.revision);
+    return finalizeAgentEditV2Response(slug, by, authoritativeMarkdown, marks, doc.revision, canonicalRequired);
   }
   if (singleWriterMode) {
     const mutation = await applySingleWriterMutation({
@@ -1084,10 +1511,9 @@ export async function applyAgentEditV2(
     });
     const snapshot = await buildSnapshot(slug);
 
-    return {
-      status: mutation.ok ? 200 : 202,
+    const swResult: AgentEditV2Result = {
+      status: 200,
       body: {
-        success: true,
         slug,
         revision: committed.revision,
         collab: {
@@ -1102,6 +1528,20 @@ export async function applyAgentEditV2(
         snapshot,
       },
     };
+    applyDivergenceShape(swResult, {
+      confirmed: mutation.ok,
+      canonicalRequired,
+      reason: mutation.ok ? null : (mutation.policy?.reason ?? (mutation as { reason?: string | null }).reason ?? null),
+    });
+    if (!mutation.ok) {
+      emitAgentEditSupersededEvent(slug, by, {
+        reason: mutation.policy?.reason ?? (mutation as { reason?: string | null }).reason ?? null,
+        canonicalRequired,
+        expectedMarkdownHead: nextMarkdown.slice(0, 200),
+        expectedMarkdownHash: createHash('sha256').update(nextMarkdown, 'utf8').digest('hex').slice(0, 16),
+      });
+    }
+    return swResult;
   }
   const mutation = await mutateCanonicalDocument({
     slug,
@@ -1151,6 +1591,6 @@ export async function applyAgentEditV2(
     },
   });
   refreshSnapshotForSlug(slug);
-  const committedSnapshot = await buildSnapshot(slug);
-  return finalizeAgentEditV2Response(slug, by, nextMarkdown, marks, mutation.document.revision);
+  await buildSnapshot(slug);
+  return finalizeAgentEditV2Response(slug, by, nextMarkdown, marks, mutation.document.revision, canonicalRequired);
 }

@@ -2468,7 +2468,7 @@ export function getStoredIdempotencyRecord(
   documentSlug: string,
   route: string,
   idempotencyKey: string,
-): { response: Record<string, unknown>; requestHash: string | null } | null {
+): { response: Record<string, unknown>; requestHash: string | null; statusCode: number } | null {
   const coordinatorRow = readCoordinatorIdempotencyRow(documentSlug, route, idempotencyKey);
   const legacyRow = readLegacyIdempotencyRow(documentSlug, route, idempotencyKey);
   const completedCoordinator = coordinatorRow?.state === 'completed' ? coordinatorRow : undefined;
@@ -2494,6 +2494,13 @@ export function getStoredIdempotencyRecord(
   return {
     response,
     requestHash: typeof row?.request_hash === 'string' ? row.request_hash : null,
+    // Surface the original status code so replay returns the same HTTP class
+    // as the first execution. Previously every replay returned 200 — which
+    // meant a previously-202 (soft-fail divergence) or 409 (hard-fail) write
+    // would silently appear "OK" on retry, contradicting the body.
+    statusCode: typeof completedCoordinator?.status_code === 'number'
+      ? completedCoordinator.status_code
+      : 200,
   };
 }
 

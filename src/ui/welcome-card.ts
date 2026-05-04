@@ -9,10 +9,20 @@ function buildDocUrl(): string {
   return url.toString();
 }
 
+function buildAgentDocsUrl(): string {
+  // Derive the agent-docs URL from the current page origin so the prompt works
+  // on any deployment (LAN IP, ngrok tunnel, hosted), not just localhost:4000.
+  try {
+    return `${window.location.origin}/agent-docs`;
+  } catch {
+    return '/agent-docs';
+  }
+}
+
 function buildPrompt(docUrl: string): string {
   return `Here's my Proof document: ${docUrl}
 
-Proof is a collaborative writing editor that tracks who wrote what (human vs AI). You can read the doc, suggest edits, leave comments, and rewrite content via its HTTP API. API docs: http://localhost:4000/agent-docs
+Proof is a collaborative writing editor that tracks who wrote what (human vs AI). You can read the doc, suggest edits, leave comments, and rewrite content via its HTTP API. API docs: ${buildAgentDocsUrl()}
 
 Connect to this document and help me get started. Write something to kick things off - here are some ideas:
 

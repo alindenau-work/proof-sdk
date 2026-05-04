@@ -70,6 +70,7 @@ test-results/
 
 # Playwright MCP screenshots
 .playwright-mcp/
+.playwright-cli/
 
 # Package locks (keep package.json)
 package-lock.json

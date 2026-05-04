@@ -81,7 +81,14 @@ import {
 } from './agent-guidance.js';
 import { buildAgentSnapshot } from './agent-snapshot.js';
 import { stripAllProofSpanTags } from './proof-span-strip.js';
-import { applyAgentEditV2 } from './agent-edit-v2.js';
+import {
+  applyAgentEditV2,
+  applyDivergenceShape,
+  emitAgentEditSupersededEvent,
+  readCanonicalRequired,
+} from './agent-edit-v2.js';
+import { applyAgentMarkdownImport } from './agent-markdown.js';
+import { buildAgentMutationLimits } from './agent-edit-limits.js';
 import { applySingleWriterMutation, isSingleWriterEditEnabled } from './collab-mutation-coordinator.js';
 import {
   cloneFromCanonical,
@@ -1987,6 +1994,7 @@ agentRoutes.get('/:slug/state', async (req: Request, res: Response) => {
   const mutationStage = getMutationContractStage();
   const mutationReady = body.mutationReady !== false;
   const authoritativeMutations = Boolean(mutationBase);
+  const collabClientBreakdown = getActiveCollabClientBreakdown(slug);
   const revision = mutationReady
     ? (typeof body.revision === 'number' ? body.revision : doc?.revision)
     : null;
@@ -1999,6 +2007,15 @@ agentRoutes.get('/:slug/state', async (req: Request, res: Response) => {
   if (!mutationReady && body.updatedAt === undefined) {
     body.updatedAt = null;
   }
+  body.connectedClients = collabClientBreakdown.total;
+  body.connectedClientBreakdown = {
+    total: collabClientBreakdown.total,
+    exactEpochCount: collabClientBreakdown.exactEpochCount,
+    anyEpochCount: collabClientBreakdown.anyEpochCount,
+    documentLeaseExactCount: collabClientBreakdown.documentLeaseExactCount,
+    documentLeaseAnyEpochCount: collabClientBreakdown.documentLeaseAnyEpochCount,
+    recentLeaseCount: collabClientBreakdown.recentLeaseCount,
+  };
   body.contract = {
     ...(isRecord(body.contract) ? body.contract : {}),
     mutationStage,
@@ -2013,9 +2030,11 @@ agentRoutes.get('/:slug/state', async (req: Request, res: Response) => {
     ...(isRecord(body.capabilities) ? body.capabilities : {}),
     snapshotV2: editV2Enabled,
     editV2: editV2Enabled && (mutationReady || authoritativeMutations),
+    markdownImport: editV2Enabled && (mutationReady || authoritativeMutations),
     topLevelOnly: editV2Enabled && (mutationReady || authoritativeMutations),
     mutationReady,
     authoritativeMutations,
+    mutationLimits: buildAgentMutationLimits(),
   };
   const links: Record<string, unknown> = {
     ...(isRecord(body._links) ? body._links : {}),
@@ -2029,6 +2048,7 @@ agentRoutes.get('/:slug/state', async (req: Request, res: Response) => {
   if (mutationReady || authoritativeMutations) {
     links.ops = { method: 'POST', href: `/api/agent/${slug}/ops` };
     links.edit = { method: 'POST', href: `/api/agent/${slug}/edit` };
+    links.markdown = { method: 'POST', href: `/api/agent/${slug}/markdown` };
     links.title = { method: 'PUT', href: `/api/documents/${slug}/title` };
   }
   if (editV2Enabled) {
@@ -2074,6 +2094,7 @@ agentRoutes.get('/:slug/state', async (req: Request, res: Response) => {
   if (mutationReady || authoritativeMutations) {
     agent.opsApi = `/api/agent/${slug}/ops`;
     agent.editApi = `/api/agent/${slug}/edit`;
+    agent.markdownApi = `/api/agent/${slug}/markdown`;
     agent.titleApi = `/api/documents/${slug}/title`;
   }
   if (editV2Enabled) {
@@ -2280,6 +2301,45 @@ agentRoutes.get('/:slug/snapshot', async (req: Request, res: Response) => {
   }
 });
 
+agentRoutes.post('/:slug/markdown', async (req: Request, res: Response) => {
+  const mutationRoute = 'POST /markdown';
+  const slug = getSlug(req);
+  if (!slug) {
+    sendMutationResponse(res, 400, { success: false, error: 'Invalid slug' }, { route: mutationRoute });
+    return;
+  }
+  if (!isFeatureEnabled(process.env.AGENT_EDIT_V2_ENABLED)) {
+    sendMutationResponse(
+      res,
+      404,
+      { success: false, error: 'Markdown import is disabled', code: 'MARKDOWN_IMPORT_DISABLED' },
+      { route: mutationRoute, slug },
+    );
+    return;
+  }
+  if (!checkAuth(req, res, slug, ['editor', 'owner_bot'])) return;
+
+  const markdownBody = isRecord(req.body) ? req.body : {};
+  ensureAgentPresenceForAuthenticatedCall(req, slug, markdownBody, 'markdown.import');
+
+  const routeKey = 'POST /markdown';
+  const replay = await maybeReplayIdempotentMutation(req, res, slug, mutationRoute, routeKey);
+  if (replay.handled) return;
+
+  const result = await applyAgentMarkdownImport(slug, req.body);
+  if (isRecord(result.body)) {
+    storeIdempotentMutationResult(replay, mutationRoute, slug, result.status, result.body);
+  } else {
+    releaseIdempotentMutationResult(replay, mutationRoute, slug, 'invalid_result_body');
+  }
+
+  if (result.status >= 200 && result.status < 300) {
+    broadcastToRoom(slug, { type: 'document.updated', source: 'agent-markdown', timestamp: new Date().toISOString() });
+  }
+
+  sendMutationResponse(res, result.status, result.body, { route: mutationRoute, slug });
+});
+
 agentRoutes.post('/:slug/edit/v2', async (req: Request, res: Response) => {
   const mutationRoute = 'POST /edit/v2';
   const slug = getSlug(req);
@@ -2313,6 +2373,7 @@ agentRoutes.post('/:slug/edit/v2', async (req: Request, res: Response) => {
     },
   });
   if (result.status >= 200 && result.status < 300 && isRecord(result.body)) {
+    const canonicalRequired = readCanonicalRequired(editV2Body);
     const participation = buildParticipationFromMutation(req, slug, editV2Body, { details: 'edit.v2' });
     if (isSingleWriterEditEnabled()) {
       const priorCollab = isRecord(result.body.collab) ? result.body.collab : {};
@@ -2335,6 +2396,14 @@ agentRoutes.post('/:slug/edit/v2', async (req: Request, res: Response) => {
         presenceApplied,
         cursorApplied,
       };
+      // applyAgentEditV2 already shaped success/code/status for the single-writer return,
+      // but we re-apply here defensively in case the handler-level merge above added
+      // anything that contradicts the convergence verdict.
+      applyDivergenceShape(result, {
+        confirmed: collabApplied,
+        canonicalRequired,
+        reason: typeof priorCollab.reason === 'string' ? priorCollab.reason : null,
+      });
       if (collabApplied) {
         broadcastToRoom(slug, { type: 'document.updated', source: 'agent-edit-v2', timestamp: new Date().toISOString() });
       }
@@ -2371,6 +2440,7 @@ agentRoutes.post('/:slug/edit/v2', async (req: Request, res: Response) => {
               : {}),
           },
         };
+        applyDivergenceShape(result, { confirmed: true, canonicalRequired, reason: null });
         broadcastToRoom(slug, { type: 'document.updated', source: 'agent-edit-v2', timestamp: new Date().toISOString() });
       } else {
         const collabStatus = await notifyCollabMutation(
@@ -2402,11 +2472,28 @@ agentRoutes.post('/:slug/edit/v2', async (req: Request, res: Response) => {
             ...(collabStatus.confirmed ? {} : { reason: collabStatus.reason ?? 'sync_timeout' }),
           },
         };
-        result.status = collabStatus.confirmed ? 200 : 202;
+        applyDivergenceShape(result, {
+          confirmed: collabStatus.confirmed,
+          canonicalRequired,
+          reason: collabStatus.reason ?? null,
+        });
 
         if (collabStatus.confirmed) {
           // Only broadcast document.updated after collab confirmation attempt is complete.
           broadcastToRoom(slug, { type: 'document.updated', source: 'agent-edit-v2', timestamp: new Date().toISOString() });
+        } else {
+          // The handler's re-verification just observed divergence; record it on the
+          // event log so polling agents detect superseded writes without diffing markdown.
+          // applyAgentEditV2 may already have emitted a superseded event on its own
+          // verdict — that's fine; consumers see at most one extra event per agent op.
+          const editBy = typeof (editV2Body as Record<string, unknown>).by === 'string'
+            && ((editV2Body as Record<string, unknown>).by as string).trim().length > 0
+            ? ((editV2Body as Record<string, unknown>).by as string).trim()
+            : 'ai:unknown';
+          emitAgentEditSupersededEvent(slug, editBy, {
+            reason: collabStatus.reason ?? null,
+            canonicalRequired,
+          });
         }
       }
     }
@@ -2942,11 +3029,9 @@ agentRoutes.post('/:slug/edit', async (req: Request, res: Response) => {
   const canonicalStatus = collabStatus.canonicalConfirmed ? 'confirmed' : 'pending';
   const includeCanonicalDiagnostics = shouldIncludeCanonicalDiagnostics();
 
-  const responseBody = {
-    success: true,
+  const responseBody: Record<string, unknown> = {
     slug,
     updatedAt: updated.updated_at,
-    collabApplied,
     collab: {
       status: collabApplied ? 'confirmed' : 'pending',
       markdownStatus,
@@ -2997,8 +3082,25 @@ agentRoutes.post('/:slug/edit', async (req: Request, res: Response) => {
     slug,
   });
 
-  storeIdempotentMutationResult(replay, mutationRoute, slug, 200, responseBody);
-  sendMutationResponse(res, 200, responseBody, { route: mutationRoute, slug });
+  // Same divergence semantics as /edit/v2: success and collabApplied flip together,
+  // status code reflects soft vs hard fail. Without this, legacy /edit was the bug
+  // we just fixed in another path (see CRITICAL Resp #1 from the bug bash).
+  const legacyResult = { status: 200, body: responseBody };
+  applyDivergenceShape(legacyResult, {
+    confirmed: collabApplied,
+    canonicalRequired: readCanonicalRequired(req.body),
+    reason: collabApplied ? null : (collabStatus.reason ?? null),
+  });
+  if (!collabApplied) {
+    emitAgentEditSupersededEvent(slug, by, {
+      reason: collabStatus.reason ?? null,
+      canonicalRequired: readCanonicalRequired(req.body),
+      expectedMarkdownHash,
+    });
+  }
+
+  storeIdempotentMutationResult(replay, mutationRoute, slug, legacyResult.status, legacyResult.body);
+  sendMutationResponse(res, legacyResult.status, legacyResult.body, { route: mutationRoute, slug });
 });
 
 agentRoutes.post('/:slug/presence', (req: Request, res: Response) => {
@@ -3221,7 +3323,7 @@ agentRoutes.post('/:slug/ops', async (req: Request, res: Response) => {
     return;
   }
 
-  let rewriteGate: ReturnType<typeof evaluateRewriteLiveClientGate> | null = null;
+  let rewriteGate: ReturnType<typeof evaluateRewriteLiveClientGateWithOptions> | null = null;
   const preBarrierMutationBase = (
     op === 'rewrite.apply'
     && mutationContext.precondition?.mode === 'token'

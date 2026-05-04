@@ -32,6 +32,7 @@ import {
   yCursorPluginKey,
   ySyncPluginKey,
   absolutePositionToRelativePosition,
+  relativePositionToAbsolutePosition,
   yXmlFragmentToProseMirrorRootNode,
 } from 'y-prosemirror';
 import { applyAwarenessUpdate, removeAwarenessStates } from 'y-protocols/awareness';
@@ -86,7 +87,9 @@ import { mermaidDiagramsPlugin } from './plugins/mermaid-diagrams';
 import { taskCheckboxesPlugin } from './plugins/task-checkboxes';
 import type { Node as ProseMirrorNode } from '@milkdown/kit/prose/model';
 import type { EditorView } from '@milkdown/kit/prose/view';
-import { TextSelection } from '@milkdown/kit/prose/state';
+import { TextSelection, type Command } from '@milkdown/kit/prose/state';
+import { lift, setBlockType, toggleMark, wrapIn } from '@milkdown/kit/prose/commands';
+import { liftListItem } from '@milkdown/kit/prose/schema-list';
 import {
   marksPlugins,
   marksPluginKey,
@@ -231,6 +234,17 @@ declare global {
 }
 
 type MilkdownPlugin = (ctx: unknown) => unknown;
+
+type LocalSelectionSnapshot = {
+  bookmark: any | null;
+  from: number;
+  to: number;
+  anchor: number;
+  head: number;
+  scrollY: number;
+  relativeAnchor: any | null;
+  relativeHead: any | null;
+};
 
 async function loadPrismPlugin(): Promise<MilkdownPlugin | null> {
   try {
@@ -1001,6 +1015,40 @@ export interface ProofEditor {
   isReviewLocked(): boolean;
 }
 
+type ShareActivityTimelineItem = {
+  id: string;
+  actor: string;
+  actorLabel: string;
+  action: string;
+  detail: string;
+  badge: string;
+  color: string;
+  at: string;
+  exactTime: string;
+  relativeTime: string;
+  sortTime: number;
+  source: 'history' | 'live';
+};
+
+type TypeToolbarBlockAction =
+  | 'paragraph'
+  | 'heading-1'
+  | 'heading-2'
+  | 'heading-3'
+  | 'bullet-list'
+  | 'ordered-list'
+  | 'blockquote';
+
+type TypeToolbarInlineAction = 'strong' | 'emphasis' | 'inlineCode';
+
+type SectionNavigatorItem = {
+  id: string;
+  heading: string;
+  level: number;
+  line: number;
+  pos: number;
+};
+
 class ProofEditorImpl implements ProofEditor {
   editor: Editor | null = null;
   heatMapMode: 'hidden' | 'subtle' | 'background' | 'full' = 'background';
@@ -1107,8 +1155,16 @@ class ProofEditorImpl implements ProofEditor {
   private findMatches: Array<{ from: number; to: number }> = [];
   private currentFindIndex: number = -1;
   private cleanupNavigation: (() => void) | null = null;
+  private typeToolbarCleanup: (() => void) | null = null;
+  private sectionNavigatorCleanup: (() => void) | null = null;
+  private sectionNavigatorItems: SectionNavigatorItem[] = [];
+  private sectionNavigatorDocSignature: string = '';
+  private sectionNavigatorRenderFrame: number = 0;
+  private sectionNavigatorActiveFrame: number = 0;
   private lastEditorInputActivitySentAt: number = 0;
   private lastLocalTypingAt: number = 0;
+  private lastLocalSelectionActivityAt: number = 0;
+  private pendingCollabRebindSelectionSnapshot: LocalSelectionSnapshot | null = null;
   private lifecycleHandlersInstalled: boolean = false;
   private readonly webHaptics = new WebHaptics();
   private readonly collabTemplateClaimStaleMs: number = 3_000;
@@ -1121,7 +1177,8 @@ class ProofEditorImpl implements ProofEditor {
   private readonly shareDocumentUpdatedDebounceMs: number = 600;
   private readonly commentPopoverDraftRestoreDelayMs: number = 120;
   private readonly commentPopoverDraftRestoreMaxAttempts: number = 10;
-  private readonly remoteCursorStabilityWindowMs: number = 500;
+  private readonly localSelectionOwnershipWindowMs: number = 30_000;
+  private readonly inlineCollabCursorsLocalStorageKey = 'proof:collab:inline-cursors';
   // Content/reporting state (used by agent integration + telemetry)
   private initState: 'idle' | 'initializing' | 'ready' = 'idle';
   private revision: number = 0;
@@ -1237,6 +1294,11 @@ class ProofEditorImpl implements ProofEditor {
         ctx.get(listenerCtx).updated((_ctx, doc, prevDoc) => {
           if (prevDoc && doc.eq(prevDoc)) return;
           this.scheduleContentSync();
+          try {
+            this.scheduleSectionNavigatorRender(_ctx.get(editorViewCtx));
+          } catch {
+            // The navigator is optional chrome and may not exist in headless tests.
+          }
         });
 
         // Initialize heatmap context
@@ -1253,6 +1315,8 @@ class ProofEditorImpl implements ProofEditor {
     (window as any).__editorView = view;
     this.updateEditableState(view);
     this.cleanupNavigation = initAgentNavigation(view);
+    this.initTypeToolbar(view);
+    this.initSectionNavigator(view);
 
     this.installLifecycleHandlers();
 
@@ -1283,6 +1347,541 @@ class ProofEditorImpl implements ProofEditor {
     }
   }
 
+  private initTypeToolbar(view: EditorView): void {
+    const toolbar = document.getElementById('toolbar');
+    if (!toolbar) return;
+
+    this.typeToolbarCleanup?.();
+
+    const blockButtons = Array.from(
+      toolbar.querySelectorAll<HTMLButtonElement>('[data-type-block]')
+    );
+    const inlineButtons = Array.from(
+      toolbar.querySelectorAll<HTMLButtonElement>('[data-type-inline]')
+    );
+
+    const keepEditorSelection = (event: Event) => {
+      event.preventDefault();
+    };
+
+    const runBlockAction = (action: TypeToolbarBlockAction) => {
+      switch (action) {
+        case 'paragraph':
+          this.applyTextBlockStyle(view, 'paragraph');
+          break;
+        case 'heading-1':
+          this.applyTextBlockStyle(view, 'heading', 1);
+          break;
+        case 'heading-2':
+          this.applyTextBlockStyle(view, 'heading', 2);
+          break;
+        case 'heading-3':
+          this.applyTextBlockStyle(view, 'heading', 3);
+          break;
+        case 'bullet-list':
+          this.toggleListStyle(view, 'bullet_list');
+          break;
+        case 'ordered-list':
+          this.toggleListStyle(view, 'ordered_list');
+          break;
+        case 'blockquote':
+          this.toggleBlockquoteStyle(view);
+          break;
+      }
+    };
+
+    const onBlockClick = (event: MouseEvent) => {
+      const button = event.currentTarget as HTMLButtonElement | null;
+      const action = button?.dataset.typeBlock as TypeToolbarBlockAction | undefined;
+      if (!action) return;
+      runBlockAction(action);
+    };
+
+    const onInlineClick = (event: MouseEvent) => {
+      const button = event.currentTarget as HTMLButtonElement | null;
+      const action = button?.dataset.typeInline as TypeToolbarInlineAction | undefined;
+      if (!action) return;
+      this.toggleInlineStyle(view, action);
+    };
+
+    for (const button of blockButtons) {
+      button.addEventListener('pointerdown', keepEditorSelection);
+      button.addEventListener('click', onBlockClick);
+    }
+    for (const button of inlineButtons) {
+      button.addEventListener('pointerdown', keepEditorSelection);
+      button.addEventListener('click', onInlineClick);
+    }
+
+    let updateFrame = 0;
+    const scheduleUpdate = () => {
+      if (updateFrame) return;
+      updateFrame = window.requestAnimationFrame(() => {
+        updateFrame = 0;
+        this.updateTypeToolbarState(view);
+      });
+    };
+
+    document.addEventListener('selectionchange', scheduleUpdate);
+    view.dom.addEventListener('keyup', scheduleUpdate);
+    view.dom.addEventListener('pointerup', scheduleUpdate);
+    view.dom.addEventListener('focusin', scheduleUpdate);
+    this.updateTypeToolbarState(view);
+
+    this.typeToolbarCleanup = () => {
+      if (updateFrame) {
+        window.cancelAnimationFrame(updateFrame);
+        updateFrame = 0;
+      }
+      document.removeEventListener('selectionchange', scheduleUpdate);
+      view.dom.removeEventListener('keyup', scheduleUpdate);
+      view.dom.removeEventListener('pointerup', scheduleUpdate);
+      view.dom.removeEventListener('focusin', scheduleUpdate);
+      for (const button of blockButtons) {
+        button.removeEventListener('pointerdown', keepEditorSelection);
+        button.removeEventListener('click', onBlockClick);
+      }
+      for (const button of inlineButtons) {
+        button.removeEventListener('pointerdown', keepEditorSelection);
+        button.removeEventListener('click', onInlineClick);
+      }
+    };
+  }
+
+  private isTypeFormattingEnabled(): boolean {
+    return !this.isReadOnly
+      && this.reviewLockCount === 0
+      && (!this.isShareMode || this.shareAllowLocalEdits);
+  }
+
+  private updateTypeToolbarState(view: EditorView): void {
+    const toolbar = document.getElementById('toolbar');
+    if (!toolbar) return;
+
+    const enabled = this.isTypeFormattingEnabled();
+    const state = this.getCurrentTypeState(view);
+
+    toolbar.querySelectorAll<HTMLButtonElement>('[data-type-block]').forEach((button) => {
+      const action = button.dataset.typeBlock;
+      const active = action === state.block;
+      button.disabled = !enabled;
+      button.dataset.active = active ? 'true' : 'false';
+      button.setAttribute('aria-pressed', active ? 'true' : 'false');
+    });
+
+    toolbar.querySelectorAll<HTMLButtonElement>('[data-type-inline]').forEach((button) => {
+      const action = button.dataset.typeInline;
+      const active = Boolean(action && state.marks.has(action));
+      button.disabled = !enabled;
+      button.dataset.active = active ? 'true' : 'false';
+      button.setAttribute('aria-pressed', active ? 'true' : 'false');
+    });
+  }
+
+  private getCurrentTypeState(view: EditorView): {
+    block: TypeToolbarBlockAction | null;
+    marks: Set<string>;
+  } {
+    const { state } = view;
+    const { $from } = state.selection;
+    const listDepth = this.findAncestorDepth(view, ['bullet_list', 'ordered_list']);
+    const blockquoteDepth = this.findAncestorDepth(view, ['blockquote']);
+    const marks = new Set<string>();
+
+    for (const markName of ['strong', 'emphasis', 'inlineCode']) {
+      if (this.isMarkActive(view, markName)) marks.add(markName);
+    }
+
+    if (listDepth !== null) {
+      const listName = $from.node(listDepth).type.name;
+      return {
+        block: listName === 'ordered_list' ? 'ordered-list' : 'bullet-list',
+        marks,
+      };
+    }
+
+    if (blockquoteDepth !== null) {
+      return { block: 'blockquote', marks };
+    }
+
+    const parent = $from.parent;
+    if (parent.type.name === 'heading') {
+      const level = Number(parent.attrs.level);
+      if (level === 1 || level === 2 || level === 3) {
+        return { block: `heading-${level}` as TypeToolbarBlockAction, marks };
+      }
+    }
+
+    if (parent.type.name === 'paragraph') {
+      return { block: 'paragraph', marks };
+    }
+
+    return { block: null, marks };
+  }
+
+  private findAncestorDepth(view: EditorView, nodeNames: string[]): number | null {
+    const { $from } = view.state.selection;
+    for (let depth = $from.depth; depth >= 0; depth -= 1) {
+      if (nodeNames.includes($from.node(depth).type.name)) return depth;
+    }
+    return null;
+  }
+
+  private isMarkActive(view: EditorView, markName: string): boolean {
+    const markType = view.state.schema.marks[markName];
+    if (!markType) return false;
+
+    const { selection } = view.state;
+    if (selection.empty) {
+      return Boolean(
+        (view.state.storedMarks ?? selection.$from.marks()).some((mark) => mark.type === markType)
+      );
+    }
+
+    return view.state.doc.rangeHasMark(selection.from, selection.to, markType);
+  }
+
+  private runTypeCommand(view: EditorView, command: Command): boolean {
+    if (!this.isTypeFormattingEnabled()) return false;
+
+    view.focus();
+    const handled = command(
+      view.state,
+      (tr) => view.dispatch(tr.scrollIntoView()),
+      view,
+    );
+    this.updateTypeToolbarState(view);
+    return handled;
+  }
+
+  private applyTextBlockStyle(view: EditorView, nodeName: 'paragraph' | 'heading', level?: number): boolean {
+    const nodeType = view.state.schema.nodes[nodeName];
+    if (!nodeType) return false;
+    const attrs = nodeName === 'heading' ? { level } : null;
+    return this.runTypeCommand(view, setBlockType(nodeType, attrs));
+  }
+
+  private toggleInlineStyle(view: EditorView, markName: TypeToolbarInlineAction): boolean {
+    if (markName === 'inlineCode') {
+      return this.toggleInlineCodeStyle(view);
+    }
+
+    const markType = view.state.schema.marks[markName];
+    if (!markType) return false;
+    return this.runTypeCommand(view, toggleMark(markType));
+  }
+
+  private toggleInlineCodeStyle(view: EditorView): boolean {
+    if (!this.isTypeFormattingEnabled()) return false;
+
+    const markType = view.state.schema.marks.inlineCode;
+    if (!markType) return false;
+
+    const { state } = view;
+    const { selection } = state;
+    if (selection.empty) return false;
+
+    const { from, to } = selection;
+    const tr = state.tr;
+    if (state.doc.rangeHasMark(from, to, markType)) {
+      tr.removeMark(from, to, markType);
+    } else {
+      Object.values(state.schema.marks).forEach((type) => {
+        if (type !== markType) tr.removeMark(from, to, type);
+      });
+      tr.addMark(from, to, markType.create());
+    }
+
+    view.focus();
+    view.dispatch(tr.scrollIntoView());
+    this.updateTypeToolbarState(view);
+    return true;
+  }
+
+  private toggleListStyle(view: EditorView, listNodeName: 'bullet_list' | 'ordered_list'): boolean {
+    const listType = view.state.schema.nodes[listNodeName];
+    if (!listType) return false;
+
+    const listDepth = this.findAncestorDepth(view, ['bullet_list', 'ordered_list']);
+    if (listDepth === null) {
+      return this.runTypeCommand(view, wrapIn(listType));
+    }
+
+    const { $from } = view.state.selection;
+    const currentList = $from.node(listDepth);
+    if (currentList.type.name === listNodeName) {
+      const listItemType = view.state.schema.nodes.list_item;
+      if (!listItemType) return false;
+      return this.runTypeCommand(view, liftListItem(listItemType));
+    }
+
+    if (!this.isTypeFormattingEnabled()) return false;
+
+    const listPos = $from.before(listDepth);
+    const attrs = listNodeName === 'ordered_list'
+      ? { order: 1, spread: currentList.attrs.spread ?? false }
+      : { spread: currentList.attrs.spread ?? false };
+    const tr = view.state.tr.setNodeMarkup(listPos, listType, attrs);
+    view.focus();
+    view.dispatch(tr.scrollIntoView());
+    this.updateTypeToolbarState(view);
+    return true;
+  }
+
+  private toggleBlockquoteStyle(view: EditorView): boolean {
+    const blockquoteType = view.state.schema.nodes.blockquote;
+    if (!blockquoteType) return false;
+
+    if (this.findAncestorDepth(view, ['blockquote']) !== null) {
+      return this.runTypeCommand(view, lift);
+    }
+
+    return this.runTypeCommand(view, wrapIn(blockquoteType));
+  }
+
+  private initSectionNavigator(view: EditorView): void {
+    const navigator = document.getElementById('section-navigator');
+    const list = document.getElementById('section-navigator-list');
+    if (!navigator || !list) return;
+
+    this.sectionNavigatorCleanup?.();
+    document.body.classList.add('section-navigator-enabled');
+
+    const scheduleRender = () => this.scheduleSectionNavigatorRender(view);
+    const scheduleActiveUpdate = () => this.scheduleSectionNavigatorActiveUpdate(view);
+    const scheduleRenderAndLayout = () => {
+      this.scheduleBannerLayoutUpdate();
+      scheduleRender();
+    };
+
+    window.addEventListener('scroll', scheduleActiveUpdate, { passive: true });
+    window.addEventListener('resize', scheduleRenderAndLayout);
+    document.addEventListener('selectionchange', scheduleActiveUpdate);
+    view.dom.addEventListener('keyup', scheduleActiveUpdate);
+    view.dom.addEventListener('pointerup', scheduleActiveUpdate);
+    view.dom.addEventListener('focusin', scheduleActiveUpdate);
+
+    this.renderSectionNavigator(view);
+
+    this.sectionNavigatorCleanup = () => {
+      if (this.sectionNavigatorRenderFrame) {
+        window.cancelAnimationFrame(this.sectionNavigatorRenderFrame);
+        this.sectionNavigatorRenderFrame = 0;
+      }
+      if (this.sectionNavigatorActiveFrame) {
+        window.cancelAnimationFrame(this.sectionNavigatorActiveFrame);
+        this.sectionNavigatorActiveFrame = 0;
+      }
+      window.removeEventListener('scroll', scheduleActiveUpdate);
+      window.removeEventListener('resize', scheduleRenderAndLayout);
+      document.removeEventListener('selectionchange', scheduleActiveUpdate);
+      view.dom.removeEventListener('keyup', scheduleActiveUpdate);
+      view.dom.removeEventListener('pointerup', scheduleActiveUpdate);
+      view.dom.removeEventListener('focusin', scheduleActiveUpdate);
+      document.body.classList.remove('section-navigator-enabled');
+      this.sectionNavigatorItems = [];
+      this.sectionNavigatorDocSignature = '';
+      this.sectionNavigatorActiveFrame = 0;
+      this.sectionNavigatorRenderFrame = 0;
+    };
+  }
+
+  private scheduleSectionNavigatorRender(view: EditorView): void {
+    if (this.sectionNavigatorRenderFrame) return;
+    this.sectionNavigatorRenderFrame = window.requestAnimationFrame(() => {
+      this.sectionNavigatorRenderFrame = 0;
+      this.renderSectionNavigator(view);
+    });
+  }
+
+  private scheduleSectionNavigatorActiveUpdate(view: EditorView): void {
+    if (this.sectionNavigatorActiveFrame) return;
+    this.sectionNavigatorActiveFrame = window.requestAnimationFrame(() => {
+      this.sectionNavigatorActiveFrame = 0;
+      this.updateSectionNavigatorActive(view);
+    });
+  }
+
+  private renderSectionNavigator(view: EditorView): void {
+    const navigator = document.getElementById('section-navigator');
+    const list = document.getElementById('section-navigator-list');
+    const count = document.getElementById('section-navigator-count');
+    if (!navigator || !list) {
+      document.body.classList.remove('section-navigator-enabled');
+      return;
+    }
+
+    document.body.classList.add('section-navigator-enabled');
+    const items = this.collectSectionNavigatorItems(view);
+    const signature = this.getSectionNavigatorSignature(items);
+    this.sectionNavigatorItems = items;
+
+    if (count) {
+      count.textContent = String(items.length);
+      count.setAttribute('aria-label', `${items.length} section${items.length === 1 ? '' : 's'}`);
+    }
+
+    if (signature !== this.sectionNavigatorDocSignature) {
+      this.sectionNavigatorDocSignature = signature;
+      list.replaceChildren();
+
+      if (items.length === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'section-navigator-empty';
+        empty.textContent = 'No headings yet.';
+        list.appendChild(empty);
+      } else {
+        for (const item of items) {
+          const button = document.createElement('button');
+          button.type = 'button';
+          button.className = 'section-navigator-item';
+          button.dataset.sectionId = item.id;
+          button.dataset.level = String(item.level);
+          button.title = item.heading;
+          button.setAttribute('aria-label', `Go to ${item.heading}`);
+
+          const marker = document.createElement('span');
+          marker.className = 'section-navigator-marker';
+          marker.textContent = `H${item.level}`;
+
+          const label = document.createElement('span');
+          label.className = 'section-navigator-label';
+          label.textContent = item.heading;
+
+          button.append(marker, label);
+          button.addEventListener('click', () => this.navigateToSection(view, item.id));
+          list.appendChild(button);
+        }
+      }
+    }
+
+    this.updateSectionNavigatorActive(view);
+  }
+
+  private collectSectionNavigatorItems(view: EditorView): SectionNavigatorItem[] {
+    const items: SectionNavigatorItem[] = [];
+    let currentLine = 0;
+    let headingIndex = 0;
+
+    view.state.doc.descendants((node, pos) => {
+      if (!node.isBlock) return true;
+      if (node.type.name === 'heading') {
+        const rawLevel = Number(node.attrs.level);
+        const level = Number.isFinite(rawLevel)
+          ? Math.max(1, Math.min(6, Math.trunc(rawLevel)))
+          : 1;
+        const heading = node.textContent.replace(/\s+/g, ' ').trim() || 'Untitled heading';
+        items.push({
+          id: `section-${pos}-${headingIndex}`,
+          heading,
+          level,
+          line: currentLine,
+          pos,
+        });
+        headingIndex += 1;
+      }
+      currentLine += 1;
+      return true;
+    });
+
+    return items;
+  }
+
+  private getSectionNavigatorSignature(items: SectionNavigatorItem[]): string {
+    return items
+      .map((item) => `${item.pos}:${item.level}:${item.line}:${item.heading}`)
+      .join('\n');
+  }
+
+  private navigateToSection(view: EditorView, sectionId: string): void {
+    const item = this.sectionNavigatorItems.find((candidate) => candidate.id === sectionId);
+    if (!item) return;
+
+    try {
+      const docSize = view.state.doc.content.size;
+      const targetPos = Math.max(0, Math.min(item.pos + 1, docSize));
+      const selection = TextSelection.near(view.state.doc.resolve(targetPos), 1);
+      view.focus();
+      view.dispatch(view.state.tr.setSelection(selection).scrollIntoView());
+
+      const dom = view.nodeDOM(item.pos);
+      if (dom instanceof HTMLElement) {
+        window.requestAnimationFrame(() => {
+          dom.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        });
+      }
+      this.setSectionNavigatorActiveItem(sectionId);
+    } catch (error) {
+      console.warn('[sectionNavigator] Failed to navigate to section', error);
+    }
+  }
+
+  private updateSectionNavigatorActive(view: EditorView): void {
+    const activeId = this.getSectionNavigatorActiveId(view);
+    this.setSectionNavigatorActiveItem(activeId);
+  }
+
+  private getSectionNavigatorActiveId(view: EditorView): string | null {
+    if (this.sectionNavigatorItems.length === 0) return null;
+
+    const selectionActiveId = this.getSectionNavigatorSelectionActiveId(view);
+    if (view.hasFocus() && selectionActiveId) return selectionActiveId;
+
+    const anchorY = this.getSectionNavigatorViewportAnchor();
+    let activeId: string | null = null;
+    let firstHeadingBelowAnchor: string | null = null;
+
+    for (const item of this.sectionNavigatorItems) {
+      const dom = view.nodeDOM(item.pos);
+      if (!(dom instanceof HTMLElement)) continue;
+
+      const rect = dom.getBoundingClientRect();
+      if (rect.top <= anchorY) {
+        activeId = item.id;
+      } else if (!firstHeadingBelowAnchor && rect.bottom >= 0) {
+        firstHeadingBelowAnchor = item.id;
+      }
+    }
+
+    if (activeId) return activeId;
+    if (firstHeadingBelowAnchor) return firstHeadingBelowAnchor;
+    if (selectionActiveId) return selectionActiveId;
+
+    return this.sectionNavigatorItems[0]?.id ?? null;
+  }
+
+  private getSectionNavigatorSelectionActiveId(view: EditorView): string | null {
+    const cursorPos = view.state.selection.from;
+    for (let i = this.sectionNavigatorItems.length - 1; i >= 0; i -= 1) {
+      const item = this.sectionNavigatorItems[i];
+      if (item.pos <= cursorPos) return item.id;
+    }
+    return null;
+  }
+
+  private getSectionNavigatorViewportAnchor(): number {
+    const rawTop = window.getComputedStyle(document.documentElement)
+      .getPropertyValue('--section-navigator-top');
+    const parsedTop = Number.parseFloat(rawTop);
+    const top = Number.isFinite(parsedTop) ? parsedTop : 76;
+    return top + 36;
+  }
+
+  private setSectionNavigatorActiveItem(activeId: string | null): void {
+    const list = document.getElementById('section-navigator-list');
+    if (!list) return;
+
+    let activeButton: HTMLButtonElement | null = null;
+    list.querySelectorAll<HTMLButtonElement>('.section-navigator-item').forEach((button) => {
+      const isActive = Boolean(activeId && button.dataset.sectionId === activeId);
+      button.dataset.active = isActive ? 'true' : 'false';
+      button.setAttribute('aria-current', isActive ? 'location' : 'false');
+      if (isActive) activeButton = button;
+    });
+
+    activeButton?.scrollIntoView({ block: 'nearest' });
+  }
+
   private installLifecycleHandlers(): void {
     if (this.lifecycleHandlersInstalled) return;
     this.lifecycleHandlersInstalled = true;
@@ -1307,6 +1906,10 @@ class ProofEditorImpl implements ProofEditor {
       }
       this.stopShareEventPoll();
       shareClient.disconnect();
+      this.typeToolbarCleanup?.();
+      this.typeToolbarCleanup = null;
+      this.sectionNavigatorCleanup?.();
+      this.sectionNavigatorCleanup = null;
       this.cleanupNavigation?.();
     });
 
@@ -1948,6 +2551,9 @@ class ProofEditorImpl implements ProofEditor {
 
       if (this.isCollabHydratedForEditing()) {
         finish();
+        this.editor?.action((ctx) => {
+          this.restorePendingCollabRebindSelection(ctx.get(editorViewCtx));
+        });
         this.markInitialCollabHydrationComplete();
         this.updateShareEditGate();
         this.scheduleContentSync();
@@ -2022,12 +2628,14 @@ class ProofEditorImpl implements ProofEditor {
         return;
       }
       const view = ctx.get(editorViewCtx);
-      collabService.mergeOptions({
-        yCursorOpts: {
-          cursorBuilder: collabCursorBuilder,
-          selectionBuilder: collabSelectionBuilder,
-        },
-      });
+      if (this.shouldInstallInlineCollabCursors()) {
+        collabService.mergeOptions({
+          yCursorOpts: {
+            cursorBuilder: collabCursorBuilder,
+            selectionBuilder: collabSelectionBuilder,
+          },
+        });
+      }
       collabService.disconnect();
       // Important: do not connect with awareness attached yet. The yCursor plugin can
       // evaluate awareness states before y-sync has built its mapping, which can throw
@@ -2039,6 +2647,7 @@ class ProofEditorImpl implements ProofEditor {
       }
       if (resetEditorDoc) {
         try {
+          this.capturePendingCollabRebindSelection(view);
           const parser = ctx.get(parserCtx);
           const emptyDoc = parser('');
           const resetTr = view.state.tr
@@ -2067,6 +2676,8 @@ class ProofEditorImpl implements ProofEditor {
   }
 
   private installCollabCursorsWhenReady(view: EditorView, ctx: any, collabService: any): void {
+    if (!this.shouldInstallInlineCollabCursors()) return;
+
     const awareness = collabClient.getAwareness();
     if (!awareness) return;
 
@@ -2120,6 +2731,17 @@ class ProofEditorImpl implements ProofEditor {
     };
 
     attemptInstall(0);
+  }
+
+  private shouldInstallInlineCollabCursors(): boolean {
+    // Remote cursor decorations live inside the editable ProseMirror DOM. In this
+    // internal writing tool, stable independent human carets matter more than
+    // seeing exact remote insertion points, so inline cursors stay opt-in only.
+    try {
+      return window.localStorage.getItem(this.inlineCollabCursorsLocalStorageKey) === '1';
+    } catch {
+      return false;
+    }
   }
 
   private applyPendingCollabTemplate(): void {
@@ -2583,10 +3205,17 @@ class ProofEditorImpl implements ProofEditor {
   }
 
   private shouldForceCollabRefreshFromPendingEvent(event: SharePendingEvent): boolean {
+    if (this.isLiveCollabDocumentUpdatedEvent(event)) return false;
     return event.type === 'document.updated'
       || event.type === 'agent.edit'
       || event.type === 'agent.edit.v2'
       || event.type === 'document.rewritten';
+  }
+
+  private isLiveCollabDocumentUpdatedEvent(event: SharePendingEvent): boolean {
+    if (event.type !== 'document.updated') return false;
+    const source = typeof event.data?.source === 'string' ? event.data.source.trim() : '';
+    return source === 'live-collab' || source === 'live-collab-backfill';
   }
 
   private shouldSkipForcedCollabRefreshFromPendingEvent(): boolean {
@@ -2719,6 +3348,30 @@ class ProofEditorImpl implements ProofEditor {
           // best-effort refresh for server-originated mark updates
         });
     }, this.shareDocumentUpdatedDebounceMs);
+  }
+
+  private applyAuthoritativeShareMarks(serverMarks: Record<string, StoredMark>): void {
+    const incomingMarks = (serverMarks && typeof serverMarks === 'object' && !Array.isArray(serverMarks))
+      ? serverMarks
+      : {};
+    this.lastReceivedServerMarks = { ...incomingMarks };
+    this.initialMarksSynced = true;
+
+    if (!this.editor || Object.keys(incomingMarks).length === 0) return;
+
+    this.editor.action((ctx) => {
+      const view = ctx.get(editorViewCtx);
+      const mergedMarks = mergePendingServerMarks(getMarkMetadata(view.state), incomingMarks);
+      this.lastReceivedServerMarks = { ...mergedMarks };
+      this.applyingCollabRemote = true;
+      this.suppressMarksSync = true;
+      try {
+        applyRemoteMarks(view, mergedMarks, { hydrateAnchors: this.collabCanEdit });
+      } finally {
+        this.suppressMarksSync = false;
+        this.applyingCollabRemote = false;
+      }
+    });
   }
 
   private getViewerText(otherViewerCount: number): string {
@@ -3016,7 +3669,7 @@ class ProofEditorImpl implements ProofEditor {
         white-space: nowrap;
       }
       #share-banner .share-pill-agent-trigger.has-agents {
-        padding: 0 4px;
+        padding: 0 12px;
       }
       #share-banner .share-pill-status-inline {
         display:inline-flex;
@@ -3094,7 +3747,7 @@ class ProofEditorImpl implements ProofEditor {
           padding: 0 10px !important;
         }
         #share-banner .share-pill-agent-trigger.has-agents {
-          padding: 0 2px !important;
+          padding: 0 8px !important;
         }
         #share-banner .share-pill-agent-trigger .agent-btn-label {
           font-size: 11px !important;
@@ -3408,9 +4061,8 @@ class ProofEditorImpl implements ProofEditor {
 
     const wordmark = document.createElement('a');
     wordmark.textContent = 'Proof';
-    wordmark.href = 'https://www.proofeditor.ai';
-    wordmark.target = '_blank';
-    wordmark.rel = 'noopener';
+    wordmark.href = '/';
+    wordmark.setAttribute('aria-label', 'Open Proof home');
     wordmark.style.cssText = 'display:inline-flex;align-items:center;justify-content:center;min-height:44px;min-width:44px;padding:0 8px;border-radius:10px;font-weight:600;color:#333;font-size:13px;letter-spacing:-0.2px;flex-shrink:0;text-decoration:none;';
 
     const separator = document.createElement('span');
@@ -3680,6 +4332,407 @@ class ProofEditorImpl implements ProofEditor {
     refreshCursors();
   }
 
+  private asActivityRecord(value: unknown): Record<string, unknown> | null {
+    return value && typeof value === 'object' && !Array.isArray(value)
+      ? value as Record<string, unknown>
+      : null;
+  }
+
+  private readActivityNumber(record: Record<string, unknown> | null, key: string): number | null {
+    const value = record?.[key];
+    return typeof value === 'number' && Number.isFinite(value) ? value : null;
+  }
+
+  private truncateActivityText(value: unknown, maxLength: number = 140): string {
+    if (typeof value !== 'string') return '';
+    const normalized = value.replace(/\s+/g, ' ').trim();
+    if (normalized.length <= maxLength) return normalized;
+    return `${normalized.slice(0, Math.max(0, maxLength - 1)).trim()}...`;
+  }
+
+  private formatActivityActorLabel(actor: string): string {
+    const trimmed = actor.trim();
+    const withoutScope = trimmed.replace(/^(human|ai|agent):/i, '').trim();
+    const base = withoutScope || trimmed || 'unknown';
+    const known: Record<string, string> = {
+      adam: 'Adam',
+      codex: 'Codex',
+      claude: 'Claude',
+      'claude-code': 'Claude Code',
+      chatgpt: 'ChatGPT',
+      owner: 'Owner',
+      anonymous: 'Anonymous',
+    };
+    const lower = base.toLowerCase();
+    if (known[lower]) return known[lower];
+    return base
+      .split(/[-_\s]+/g)
+      .filter(Boolean)
+      .map((part) => `${part.charAt(0).toUpperCase()}${part.slice(1)}`)
+      .join(' ') || 'Unknown';
+  }
+
+  private getActivityActorColor(actor: string): string {
+    const colors = [
+      '#2563eb',
+      '#059669',
+      '#d97706',
+      '#dc2626',
+      '#7c3aed',
+      '#0891b2',
+      '#be123c',
+      '#4f46e5',
+    ];
+    let hash = 0;
+    for (let i = 0; i < actor.length; i += 1) {
+      hash = ((hash << 5) - hash + actor.charCodeAt(i)) | 0;
+    }
+    return colors[Math.abs(hash) % colors.length];
+  }
+
+  private formatActivityTime(iso: string): { exact: string; relative: string; sortTime: number } {
+    const parsed = Date.parse(iso);
+    if (!Number.isFinite(parsed)) {
+      return { exact: 'Unknown time', relative: 'unknown', sortTime: 0 };
+    }
+    const date = new Date(parsed);
+    const exact = date.toLocaleString(undefined, {
+      month: 'short',
+      day: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit',
+    });
+    const diffMs = Date.now() - parsed;
+    if (!Number.isFinite(diffMs) || diffMs < 0) return { exact, relative: exact, sortTime: parsed };
+    if (diffMs < 60_000) return { exact, relative: 'just now', sortTime: parsed };
+    if (diffMs < 3_600_000) return { exact, relative: `${Math.floor(diffMs / 60_000)}m ago`, sortTime: parsed };
+    if (diffMs < 86_400_000) return { exact, relative: `${Math.floor(diffMs / 3_600_000)}h ago`, sortTime: parsed };
+    if (diffMs < 604_800_000) return { exact, relative: `${Math.floor(diffMs / 86_400_000)}d ago`, sortTime: parsed };
+    return { exact, relative: exact, sortTime: parsed };
+  }
+
+  private summarizeLineChange(record: Record<string, unknown> | null): string {
+    if (!record) return '';
+    const addedLines = this.readActivityNumber(record, 'addedLines');
+    const removedLines = this.readActivityNumber(record, 'removedLines');
+    const changedLines = this.readActivityNumber(record, 'changedLines');
+    const charDelta = this.readActivityNumber(record, 'charDelta');
+    const afterRevision = this.readActivityNumber(record, 'afterRevision');
+    const parts: string[] = [];
+
+    if ((addedLines ?? 0) > 0) parts.push(`+${addedLines} line${addedLines === 1 ? '' : 's'}`);
+    if ((removedLines ?? 0) > 0) parts.push(`-${removedLines} line${removedLines === 1 ? '' : 's'}`);
+    if (parts.length === 0 && changedLines !== null && changedLines > 0) {
+      parts.push(`${changedLines} changed line${changedLines === 1 ? '' : 's'}`);
+    }
+    if (charDelta !== null && charDelta !== 0) {
+      parts.push(`${charDelta > 0 ? '+' : ''}${charDelta} chars`);
+    }
+    if (afterRevision !== null) {
+      parts.push(`revision ${afterRevision}`);
+    }
+    return parts.join(' | ');
+  }
+
+  private summarizeMarksChange(record: Record<string, unknown> | null): string {
+    if (!record) return '';
+    const added = this.readActivityNumber(record, 'added') ?? 0;
+    const updated = this.readActivityNumber(record, 'updated') ?? 0;
+    const removed = this.readActivityNumber(record, 'removed') ?? 0;
+    const parts: string[] = [];
+    if (added > 0) parts.push(`${added} added`);
+    if (updated > 0) parts.push(`${updated} updated`);
+    if (removed > 0) parts.push(`${removed} removed`);
+    return parts.length ? `marks: ${parts.join(', ')}` : '';
+  }
+
+  private summarizeActivityOperations(operations: unknown): string {
+    if (!Array.isArray(operations) || operations.length === 0) return '';
+    const counts = new Map<string, number>();
+    let firstTarget = '';
+    for (const operation of operations) {
+      const record = this.asActivityRecord(operation);
+      const op = typeof record?.op === 'string' && record.op.trim() ? record.op.trim() : 'edit';
+      counts.set(op, (counts.get(op) ?? 0) + 1);
+      if (!firstTarget) {
+        const target = this.asActivityRecord(record?.target);
+        firstTarget = this.truncateActivityText(record?.search)
+          || this.truncateActivityText(target?.anchor)
+          || this.truncateActivityText(record?.section)
+          || this.truncateActivityText(record?.after);
+      }
+    }
+    const countText = Array.from(counts.entries())
+      .map(([op, count]) => `${count} ${op}`)
+      .join(', ');
+    return `${operations.length} operation${operations.length === 1 ? '' : 's'}${countText ? `: ${countText}` : ''}${firstTarget ? `. Target: ${firstTarget}` : ''}`;
+  }
+
+  private buildShareHistoryTimelineItem(event: SharePendingEvent): ShareActivityTimelineItem {
+    const data = this.asActivityRecord(event.data) ?? {};
+    const actor = typeof event.actor === 'string' && event.actor.trim()
+      ? event.actor.trim()
+      : typeof data.by === 'string' && data.by.trim()
+        ? data.by.trim()
+        : typeof data.actor === 'string' && data.actor.trim()
+          ? data.actor.trim()
+          : 'unknown';
+    const time = this.formatActivityTime(event.createdAt);
+    let action = event.type;
+    let detail = '';
+    let badge = 'Saved';
+
+    if (event.type === 'document.created') {
+      action = 'created the plan';
+      detail = this.truncateActivityText(data.title) || 'Initial document';
+    } else if (event.type === 'document.title.updated') {
+      action = 'renamed the plan';
+      const beforeTitle = this.truncateActivityText(data.before, 60);
+      const afterTitle = this.truncateActivityText(data.after, 60) || this.truncateActivityText(data.title, 60);
+      detail = beforeTitle && afterTitle ? `${beforeTitle} to ${afterTitle}` : afterTitle || this.truncateActivityText(data.actor);
+    } else if (event.type === 'document.updated') {
+      action = 'edited the plan';
+      const changes = this.asActivityRecord(data.changes);
+      const content = this.summarizeLineChange(this.asActivityRecord(changes?.content));
+      const marks = this.summarizeMarksChange(this.asActivityRecord(changes?.marks));
+      const title = this.asActivityRecord(changes?.title);
+      const titleDetail = title ? 'title changed' : '';
+      detail = [content, marks, titleDetail].filter(Boolean).join(' | ')
+        || this.summarizeLineChange(this.asActivityRecord(data.integrity))
+        || this.truncateActivityText(data.source);
+    } else if (event.type === 'document.rewritten') {
+      action = 'rewrote the plan';
+      detail = typeof data.mode === 'string' ? `mode: ${data.mode}` : '';
+    } else if (event.type === 'agent.edit' || event.type === 'agent.edit.v2') {
+      action = 'edited the plan';
+      detail = this.summarizeActivityOperations(data.operations);
+      badge = event.type === 'agent.edit.v2' ? 'Edit v2' : 'Edit';
+    } else if (event.type === 'agent.presence') {
+      action = 'joined the plan';
+      detail = [this.truncateActivityText(data.name), this.truncateActivityText(data.status), this.truncateActivityText(data.details)].filter(Boolean).join(' | ');
+      badge = 'Presence';
+    } else if (event.type === 'agent.disconnected') {
+      action = 'left the plan';
+      detail = this.truncateActivityText(data.name) || this.truncateActivityText(data.status);
+      badge = 'Presence';
+    } else if (event.type === 'comment.added') {
+      action = 'added a comment';
+      detail = this.truncateActivityText(data.text) || this.truncateActivityText(data.quote);
+      badge = 'Comment';
+    } else if (event.type === 'comment.replied') {
+      action = 'replied to a comment';
+      detail = this.truncateActivityText(data.text);
+      badge = 'Comment';
+    } else if (event.type === 'comment.resolved') {
+      action = 'resolved a comment';
+      detail = this.truncateActivityText(data.markId);
+      badge = 'Comment';
+    } else if (event.type === 'comment.unresolved') {
+      action = 'reopened a comment';
+      detail = this.truncateActivityText(data.markId);
+      badge = 'Comment';
+    } else if (event.type.startsWith('suggestion.')) {
+      const parts = event.type.split('.');
+      const kind = parts.length >= 3 ? parts[1] : '';
+      const status = parts.length >= 3 ? parts[2] : parts[1];
+      action = status === 'added'
+        ? `suggested ${kind || 'a change'}`
+        : `${status || 'updated'} a suggestion`;
+      detail = this.truncateActivityText(data.content) || this.truncateActivityText(data.quote) || this.truncateActivityText(data.markId);
+      badge = 'Suggestion';
+    } else if (event.type === 'document.paused') {
+      action = 'paused the plan';
+    } else if (event.type === 'document.resumed') {
+      action = 'resumed the plan';
+    } else if (event.type === 'document.revoked') {
+      action = 'revoked access';
+    } else if (event.type === 'document.deleted') {
+      action = 'deleted the plan';
+    }
+
+    return {
+      id: `history:${event.id}`,
+      actor,
+      actorLabel: this.formatActivityActorLabel(actor),
+      action,
+      detail,
+      badge,
+      color: this.getActivityActorColor(actor),
+      at: event.createdAt,
+      exactTime: time.exact,
+      relativeTime: time.relative,
+      sortTime: time.sortTime || event.id,
+      source: 'history',
+    };
+  }
+
+  private buildLiveActivityTimelineItems(): ShareActivityTimelineItem[] {
+    return this.shareAgentActivityItems.slice(-50).map((item, index) => {
+      const actor = typeof item.id === 'string' && item.id.trim() ? item.id.trim() : 'agent';
+      const displayName = typeof item.name === 'string' && item.name.trim() ? item.name.trim() : actor;
+      const at = typeof item.at === 'string' && item.at.trim() ? item.at.trim() : new Date().toISOString();
+      const time = this.formatActivityTime(at);
+      const status = typeof item.status === 'string' && item.status.trim()
+        ? item.status.trim()
+        : typeof item.type === 'string' && item.type.trim()
+          ? item.type.trim()
+          : 'active';
+      const details = typeof item.details === 'string' ? item.details : '';
+      return {
+        id: `live:${index}:${actor}:${at}`,
+        actor,
+        actorLabel: this.formatActivityActorLabel(displayName),
+        action: status,
+        detail: this.truncateActivityText(details),
+        badge: 'Live',
+        color: this.getActivityActorColor(actor),
+        at,
+        exactTime: time.exact,
+        relativeTime: time.relative,
+        sortTime: time.sortTime || index,
+        source: 'live',
+      };
+    });
+  }
+
+  private dedupeLiveActivityItems(
+    historyItems: ShareActivityTimelineItem[],
+    liveItems: ShareActivityTimelineItem[],
+  ): ShareActivityTimelineItem[] {
+    return liveItems.filter((live) => !historyItems.some((history) => (
+      history.actor === live.actor
+      && Math.abs(history.sortTime - live.sortTime) < 1500
+      && (history.action === live.action || history.badge === live.badge)
+    )));
+  }
+
+  private renderShareActivityBody(
+    body: HTMLElement,
+    items: ShareActivityTimelineItem[],
+    options?: { loading?: boolean; error?: string | null },
+  ): void {
+    body.replaceChildren();
+    const sorted = [...items].sort((a, b) => b.sortTime - a.sortTime).slice(0, 200);
+
+    const summary = document.createElement('div');
+    summary.style.cssText = 'display:flex;flex-wrap:wrap;gap:8px;padding:2px 0 12px 0;border-bottom:1px solid rgba(255,255,255,0.10);margin-bottom:4px;';
+
+    const actorCounts = new Map<string, { label: string; color: string; count: number }>();
+    for (const item of sorted) {
+      const entry = actorCounts.get(item.actor) ?? { label: item.actorLabel, color: item.color, count: 0 };
+      entry.count += 1;
+      actorCounts.set(item.actor, entry);
+    }
+
+    if (actorCounts.size > 0) {
+      for (const actor of Array.from(actorCounts.values()).sort((a, b) => b.count - a.count).slice(0, 8)) {
+        const chip = document.createElement('div');
+        chip.style.cssText = 'display:inline-flex;align-items:center;gap:6px;padding:5px 8px;border-radius:999px;background:rgba(255,255,255,0.08);color:rgba(255,255,255,0.88);font-size:11px;line-height:1;';
+        const dot = document.createElement('span');
+        dot.style.cssText = `width:7px;height:7px;border-radius:50%;background:${actor.color};display:inline-block;`;
+        const label = document.createElement('span');
+        label.textContent = actor.label;
+        const count = document.createElement('span');
+        count.textContent = String(actor.count);
+        count.style.cssText = 'color:rgba(255,255,255,0.55);';
+        chip.append(dot, label, count);
+        summary.appendChild(chip);
+      }
+    } else {
+      const hint = document.createElement('div');
+      hint.textContent = options?.loading ? 'Loading saved change history...' : 'No saved change history yet.';
+      hint.style.cssText = 'color:rgba(255,255,255,0.66);font-size:12px;line-height:1.4;';
+      summary.appendChild(hint);
+    }
+    body.appendChild(summary);
+
+    if (options?.error) {
+      const error = document.createElement('div');
+      error.textContent = options.error;
+      error.style.cssText = 'margin:10px 0;padding:9px 10px;border-radius:10px;background:rgba(248,113,113,0.14);color:rgba(254,226,226,0.95);font-size:12px;line-height:1.35;';
+      body.appendChild(error);
+    }
+
+    if (sorted.length === 0) {
+      const empty = document.createElement('div');
+      empty.textContent = options?.loading ? 'Loading saved change history...' : 'No activity yet.';
+      empty.style.cssText = 'padding:14px 0;color:rgba(255,255,255,0.70);font-size:12px;line-height:1.35';
+      body.appendChild(empty);
+      return;
+    }
+
+    const list = document.createElement('div');
+    list.style.cssText = 'display:flex;flex-direction:column;';
+
+    for (const item of sorted) {
+      const row = document.createElement('div');
+      row.style.cssText = 'display:grid;grid-template-columns:14px minmax(0,1fr);gap:10px;padding:12px 0;border-bottom:1px solid rgba(255,255,255,0.08);font-size:12px;line-height:1.35;';
+
+      const rail = document.createElement('div');
+      rail.style.cssText = 'display:flex;justify-content:center;padding-top:3px;';
+      const dot = document.createElement('span');
+      dot.style.cssText = `width:9px;height:9px;border-radius:50%;background:${item.color};box-shadow:0 0 0 3px ${item.color}24;`;
+      rail.appendChild(dot);
+
+      const content = document.createElement('div');
+      content.style.cssText = 'min-width:0;';
+
+      const meta = document.createElement('div');
+      meta.style.cssText = 'display:flex;align-items:center;gap:8px;min-width:0;color:rgba(255,255,255,0.62);font-size:11px;';
+      const actor = document.createElement('span');
+      actor.textContent = item.actorLabel;
+      actor.style.cssText = 'color:rgba(255,255,255,0.92);font-weight:700;';
+      const badge = document.createElement('span');
+      badge.textContent = item.badge;
+      badge.style.cssText = 'padding:2px 6px;border-radius:999px;background:rgba(255,255,255,0.08);color:rgba(255,255,255,0.68);font-size:10px;';
+      const time = document.createElement('span');
+      time.textContent = item.relativeTime;
+      time.title = item.exactTime;
+      meta.append(actor, badge, time);
+
+      const action = document.createElement('div');
+      action.textContent = item.action;
+      action.style.cssText = 'margin-top:3px;color:rgba(255,255,255,0.90);font-size:13px;font-weight:600;';
+      content.append(meta, action);
+
+      if (item.detail) {
+        const detail = document.createElement('div');
+        detail.textContent = item.detail;
+        detail.style.cssText = 'margin-top:3px;color:rgba(255,255,255,0.66);font-size:12px;overflow-wrap:anywhere;';
+        content.appendChild(detail);
+      }
+
+      row.append(rail, content);
+      list.appendChild(row);
+    }
+
+    body.appendChild(list);
+  }
+
+  private async loadShareActivityHistory(body: HTMLElement): Promise<void> {
+    const liveItems = this.buildLiveActivityTimelineItems();
+    this.renderShareActivityBody(body, liveItems, { loading: true });
+    try {
+      const payload = await shareClient.fetchPendingEvents(0, { limit: 200 });
+      if (!body.isConnected) return;
+      if (!payload || 'error' in payload) {
+        this.renderShareActivityBody(body, liveItems, {
+          error: 'Could not load saved change history. Showing live activity only.',
+        });
+        return;
+      }
+      const historyItems = payload.events.map((event) => this.buildShareHistoryTimelineItem(event));
+      const liveOnly = this.dedupeLiveActivityItems(historyItems, liveItems);
+      this.renderShareActivityBody(body, [...historyItems, ...liveOnly]);
+    } catch (error) {
+      if (!body.isConnected) return;
+      console.warn('[share] Failed to load activity history', error);
+      this.renderShareActivityBody(body, liveItems, {
+        error: 'Could not load saved change history. Showing live activity only.',
+      });
+    }
+  }
+
   private openShareActivityModal(): void {
     const overlay = document.createElement('div');
     overlay.style.cssText = `
@@ -3703,7 +4756,7 @@ class ProofEditorImpl implements ProofEditor {
     const header = document.createElement('div');
     header.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 16px;border-bottom:1px solid rgba(255,255,255,0.10)';
     const title = document.createElement('div');
-    title.textContent = 'Activity';
+    title.textContent = 'Change history';
     title.style.cssText = 'font-size:13px;font-weight:700;letter-spacing:0.02em';
     const close = document.createElement('button');
     close.type = 'button';
@@ -3714,21 +4767,175 @@ class ProofEditorImpl implements ProofEditor {
     const body = document.createElement('div');
     body.style.cssText = 'max-height:60vh;overflow:auto;padding:10px 16px 16px 16px';
 
-    const items = this.shareAgentActivityItems.slice(-50).reverse();
+    panel.append(header, body);
+    overlay.appendChild(panel);
+    document.body.appendChild(overlay);
+    void this.loadShareActivityHistory(body);
+
+    const cleanup = () => {
+      if (!overlay.isConnected) return;
+      overlay.remove();
+      document.removeEventListener('keydown', onKeyDown, true);
+    };
+    const onKeyDown = (ev: KeyboardEvent) => {
+      if (ev.key === 'Escape') cleanup();
+    };
+    document.addEventListener('keydown', onKeyDown, true);
+    overlay.addEventListener('mousedown', (ev) => {
+      if (ev.target === overlay) cleanup();
+    });
+    close.onclick = cleanup;
+  }
+
+  private getReviewItems(): Mark[] {
+    if (!this.editor) return [];
+    let items: Mark[] = [];
+    this.editor.action((ctx) => {
+      const view = ctx.get(editorViewCtx);
+      const marks = getMarks(view.state);
+      items = marks
+        .filter((mark) => {
+          if (mark.kind === 'flagged' || mark.kind === 'approved') return true;
+          if (mark.kind === 'comment') {
+            const data = mark.data as CommentData | undefined;
+            return !data?.resolved;
+          }
+          if (mark.kind === 'insert' || mark.kind === 'delete' || mark.kind === 'replace') {
+            const status = (mark.data as { status?: unknown } | undefined)?.status;
+            return status !== 'accepted' && status !== 'rejected';
+          }
+          return false;
+        })
+        .sort((a, b) => (a.range?.from ?? Number.MAX_SAFE_INTEGER) - (b.range?.from ?? Number.MAX_SAFE_INTEGER));
+    });
+    return items;
+  }
+
+  private getReviewItemTypeLabel(mark: Mark): string {
+    switch (mark.kind) {
+      case 'comment':
+        return 'Comment';
+      case 'flagged':
+        return 'Flag';
+      case 'approved':
+        return 'Approval';
+      case 'insert':
+        return 'Insert suggestion';
+      case 'delete':
+        return 'Delete suggestion';
+      case 'replace':
+        return 'Replace suggestion';
+      case 'authored':
+        return 'Authorship';
+      default:
+        return 'Item';
+    }
+  }
+
+  private getReviewItemBody(mark: Mark): string {
+    if (mark.kind === 'comment') {
+      const data = mark.data as CommentData | undefined;
+      return data?.text?.trim() || mark.quote || 'Comment';
+    }
+    if (mark.kind === 'flagged') {
+      const note = (mark.data as { note?: string } | undefined)?.note?.trim();
+      return note || mark.quote || 'Flagged text';
+    }
+    if (mark.kind === 'insert' || mark.kind === 'replace') {
+      const content = (mark.data as { content?: string } | undefined)?.content?.trim();
+      return content || mark.quote || 'Suggested change';
+    }
+    return mark.quote || this.getReviewItemTypeLabel(mark);
+  }
+
+  private openReviewItemsModal(): void {
+    const items = this.getReviewItems();
+    const counts = items.reduce((acc, mark) => {
+      const key = mark.kind === 'insert' || mark.kind === 'delete' || mark.kind === 'replace'
+        ? 'suggestion'
+        : mark.kind;
+      acc[key] = (acc[key] ?? 0) + 1;
+      return acc;
+    }, {} as Record<string, number>);
+
+    const overlay = document.createElement('div');
+    overlay.style.cssText = `
+      position:fixed;inset:0;z-index:1100;
+      background:rgba(0,0,0,0.55);
+      display:flex;align-items:flex-start;justify-content:center;
+      padding:48px 16px;
+    `;
+
+    const panel = document.createElement('div');
+    panel.style.cssText = `
+      width:min(760px, 100%);
+      background:rgba(17,24,39,0.98);
+      border:1px solid rgba(255,255,255,0.12);
+      border-radius:16px;
+      box-shadow:0 24px 60px rgba(0,0,0,0.45);
+      color:rgba(255,255,255,0.92);
+      overflow:hidden;
+    `;
+
+    const header = document.createElement('div');
+    header.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 16px;border-bottom:1px solid rgba(255,255,255,0.10)';
+    const titleWrap = document.createElement('div');
+    const title = document.createElement('div');
+    title.textContent = 'Review items';
+    title.style.cssText = 'font-size:13px;font-weight:700;letter-spacing:0.02em';
+    const summary = document.createElement('div');
+    summary.textContent = [
+      `${counts.comment ?? 0} comments`,
+      `${counts.suggestion ?? 0} suggestions`,
+      `${counts.flagged ?? 0} flags`,
+      `${counts.approved ?? 0} approvals`,
+    ].join(' · ');
+    summary.style.cssText = 'margin-top:3px;color:rgba(255,255,255,0.62);font-size:11px;line-height:1.3';
+    titleWrap.append(title, summary);
+    const close = document.createElement('button');
+    close.type = 'button';
+    close.textContent = 'Close';
+    close.style.cssText = 'border:0;background:rgba(255,255,255,0.10);color:white;padding:6px 10px;border-radius:999px;font-size:12px;cursor:pointer';
+    header.append(titleWrap, close);
+
+    const body = document.createElement('div');
+    body.style.cssText = 'max-height:62vh;overflow:auto;padding:10px 16px 16px 16px';
+
     if (items.length === 0) {
       const empty = document.createElement('div');
-      empty.textContent = 'No activity yet.';
+      empty.textContent = 'No comments, suggestions, flags, or approvals yet.';
       empty.style.cssText = 'padding:14px 0;color:rgba(255,255,255,0.70);font-size:12px;line-height:1.35';
       body.appendChild(empty);
     } else {
-      for (const item of items) {
-        const row = document.createElement('div');
-        row.style.cssText = 'padding:10px 0;border-bottom:1px solid rgba(255,255,255,0.08);font-size:12px;line-height:1.35';
-        const when = typeof item.at === 'string' ? item.at : '';
-        const who = typeof item.name === 'string' ? item.name : (typeof item.id === 'string' ? item.id : 'agent');
-        const status = typeof item.status === 'string' ? item.status : (typeof item.type === 'string' ? item.type : '');
-        const details = typeof item.details === 'string' ? item.details : '';
-        row.textContent = `${when}  ${who}  ${status}${details ? ` — ${details}` : ''}`;
+      for (const mark of items) {
+        const row = document.createElement('button');
+        row.type = 'button';
+        row.style.cssText = `
+          width:100%;display:block;text-align:left;padding:11px 0;border:0;border-bottom:1px solid rgba(255,255,255,0.08);
+          background:transparent;color:inherit;cursor:pointer;font-family:inherit;
+        `;
+        row.onmouseenter = () => { row.style.background = 'rgba(255,255,255,0.04)'; };
+        row.onmouseleave = () => { row.style.background = 'transparent'; };
+
+        const meta = document.createElement('div');
+        meta.textContent = `${this.getReviewItemTypeLabel(mark)} · ${mark.by || 'unknown'}`;
+        meta.style.cssText = 'color:rgba(255,255,255,0.62);font-size:11px;font-weight:700;letter-spacing:0.03em;text-transform:uppercase;margin-bottom:4px';
+
+        const text = document.createElement('div');
+        const bodyText = this.getReviewItemBody(mark).replace(/\s+/g, ' ').trim();
+        text.textContent = bodyText.length > 180 ? `${bodyText.slice(0, 177)}...` : bodyText;
+        text.style.cssText = 'color:rgba(255,255,255,0.92);font-size:12px;line-height:1.4;word-break:break-word';
+
+        const quote = document.createElement('div');
+        const quoteText = mark.quote?.replace(/\s+/g, ' ').trim() ?? '';
+        quote.textContent = quoteText ? `Anchor: ${quoteText.length > 150 ? `${quoteText.slice(0, 147)}...` : quoteText}` : 'Anchor unavailable';
+        quote.style.cssText = 'margin-top:5px;color:rgba(255,255,255,0.50);font-size:11px;line-height:1.35;word-break:break-word';
+
+        row.append(meta, text, quote);
+        row.onclick = () => {
+          cleanup();
+          this.navigateToMark(mark.id);
+        };
         body.appendChild(row);
       }
     }
@@ -3786,13 +4993,14 @@ class ProofEditorImpl implements ProofEditor {
     const body = document.createElement('div');
     body.style.cssText = 'padding:14px 16px 16px 16px;color:rgba(255,255,255,0.86);font-size:12px;line-height:1.5;';
     body.innerHTML = `
-      <p style="margin:0 0 10px 0;">Agent collaborators can suggest and edit with the same permissions as the link you share.</p>
+      <p style="margin:0 0 10px 0;">Agent collaborators use this Proof doc as a live drafting surface. HandBrake and GitHub remain the canonical product record.</p>
       <p style="margin:0 0 8px 0;"><strong>How to connect:</strong></p>
       <ol style="margin:0 0 10px 18px;padding:0;">
-        <li>Copy the agent invite link.</li>
-        <li>Paste it into your AI tool (for example, ChatGPT or Claude).</li>
+        <li>Copy the agent instructions.</li>
+        <li>Paste the full instruction block into Codex or Claude.</li>
         <li>The agent appears here when connected.</li>
       </ol>
+      <p style="margin:0 0 8px 0;color:rgba(255,255,255,0.78);">Agents should comment, suggest, or make scoped edits here. They should not touch the HandBrake repo, GitHub, or Supabase from this Proof context unless Adam explicitly asks them to package the draft into repo work.</p>
       <p style="margin:0;color:rgba(255,255,255,0.72);">Disconnect removes live presence from this doc, but does not revoke the link.</p>
     `;
 
@@ -3885,6 +5093,56 @@ class ProofEditorImpl implements ProofEditor {
     return prompted;
   }
 
+  private async downloadMarkdownFromShare(): Promise<boolean> {
+    try {
+      const response = await fetch(this.getCanonicalShareUrl(), {
+        headers: { Accept: 'text/markdown' },
+        credentials: 'include',
+        cache: 'no-store',
+      });
+      if (!response.ok) {
+        throw new Error(`Markdown export failed with HTTP ${response.status}`);
+      }
+      const markdown = await response.text();
+      this.downloadMarkdownBlob(stripProofSpanTags(markdown));
+      this.triggerHaptic('success');
+      return true;
+    } catch (error) {
+      console.error('[share] Failed to download markdown export', error);
+      return false;
+    }
+  }
+
+  private buildMarkdownDownloadFilename(): string {
+    const title = (this.shareDocTitle || '').trim();
+    const slug = shareClient.getSlug() || this.extractShareSlugFromUrl(this.getCanonicalShareUrl()) || '';
+    const raw = title && title !== 'Untitled' ? title : slug;
+    const base = raw
+      .normalize('NFKD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/[^a-zA-Z0-9._-]+/g, '-')
+      .replace(/-{2,}/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .toLowerCase();
+    const filename = base || 'proof-document';
+    return filename.endsWith('.md') ? filename : `${filename}.md`;
+  }
+
+  private downloadMarkdownBlob(markdown: string): void {
+    const content = markdown.endsWith('\n') ? markdown : `${markdown}\n`;
+    const blob = new Blob([content], { type: 'text/markdown;charset=utf-8' });
+    const url = window.URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = this.buildMarkdownDownloadFilename();
+    anchor.rel = 'noopener';
+    anchor.style.display = 'none';
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    window.setTimeout(() => window.URL.revokeObjectURL(url), 0);
+  }
+
   private extractShareSlugFromUrl(shareUrl: string): string | null {
     try {
       const url = new URL(shareUrl);
@@ -3911,13 +5169,22 @@ class ProofEditorImpl implements ProofEditor {
     const shareUrl = this.getCanonicalShareUrl();
     const slug = shareClient.getSlug() || this.extractShareSlugFromUrl(shareUrl);
     const token = this.extractShareTokenFromUrl(shareUrl);
-    const origin = (() => {
+    const configuredBase = (() => {
+      const proofConfig = (window as Window & {
+        __PROOF_CONFIG__?: { shareServerBaseURL?: string };
+      }).__PROOF_CONFIG__ ?? {};
+      return typeof proofConfig.shareServerBaseURL === 'string' && proofConfig.shareServerBaseURL.trim()
+        ? proofConfig.shareServerBaseURL.trim().replace(/\/+$/, '')
+        : '';
+    })();
+    const fallbackOrigin = (() => {
       try {
         return new URL(shareUrl).origin;
       } catch {
         return window.location.origin;
       }
     })();
+    const origin = configuredBase || fallbackOrigin;
 
     if (!slug) {
       return [
@@ -3928,32 +5195,63 @@ class ProofEditorImpl implements ProofEditor {
     }
 
     const encodedSlug = encodeURIComponent(slug);
+    const docUrl = `${origin}/d/${encodedSlug}${token ? `?token=${encodeURIComponent(token)}` : ''}`;
+    const healthUrl = `${origin}/health`;
     const presenceUrl = `${origin}/api/agent/${encodedSlug}/presence`;
     const stateUrl = `${origin}/api/agent/${encodedSlug}/state`;
     const opsUrl = `${origin}/api/agent/${encodedSlug}/ops`;
-    const editUrl = `${origin}/api/agent/${encodedSlug}/edit`;
+    const markdownUrl = `${origin}/api/agent/${encodedSlug}/markdown`;
+    const editV2Url = `${origin}/api/agent/${encodedSlug}/edit/v2`;
 
     return [
       'Collaborate with me on this Proof doc.',
       '',
-      `Doc: ${shareUrl}`,
+      'Context:',
+      '- Proof is the live drafting room for Adam, Pete, Codex, and Claude.',
+      '- HandBrake remains the canonical product repo and GitHub remains the durable change record.',
+      '- This Proof doc is collaboration state, not permission to bypass HandBrake process.',
+      '',
+      `Doc: ${docUrl}`,
+      `API base: ${origin}`,
       '',
       'Auth for each API request:',
       `- x-share-token: ${token || '<token-from-doc-url>'}`,
       '- X-Agent-Id: <your-agent-id>',
       '- (Use the token from the Doc URL query param: ?token=...)',
+      '- If the Doc URL does not include a token, stop and ask Adam for a tokenized Proof link.',
+      '',
+      'Identity requirement:',
+      '- Before your first API request, choose a unique, stable agent id for this Proof session. Do not reuse another active agent identity.',
+      '- Use that exact value in the X-Agent-Id header and in your presence body.',
+      '- Use a human-readable presence name that makes platform and role clear, for example "Codex docs reviewer" or "Claude math reviewer".',
+      '- Register that presence before making comments, suggestions, flags, or edits.',
+      '- In your original Codex/Claude chat, reply with: Agent identity: <X-Agent-Id> / <presence-name> before doing document work.',
+      '',
+      'Strict rules:',
+      '- Stay inside your assigned HandBrake role. If no role was assigned, act only as a reviewer/commenter in Proof.',
+      '- Use Proof for comments, suggestions, and scoped edits to this draft only.',
+      '- Do not edit the HandBrake repo, run migrations, touch Supabase, create branches, commit, push, open PRs, or merge unless Adam explicitly asks you to package this draft into repo work.',
+      '- If Adam asks you to move work into HandBrake, follow the repo cadence: one issue, one role branch, one scoped PR, required checks green, no direct pushes to main, and no pulling from another agent branch.',
+      '- Do not replace the whole document unless explicitly asked. Prefer small, reviewable edits and explain what changed.',
+      '- If the API is unreachable, stop and report the exact URL you tried. Do not silently switch to localhost unless the Doc URL itself is localhost and you are running on that same machine.',
       '',
       'Start here:',
-      '1) Read current document state with your identity header:',
+      '1) Confirm the Proof server is reachable:',
+      `   GET ${healthUrl}`,
+      '2) Read current document state with your identity headers:',
       `   GET ${stateUrl}`,
-      '   header: X-Agent-Id: <your-agent-id>',
-      '2) Optionally set your friendly name in presence:',
+      '   headers: x-share-token and X-Agent-Id',
+      '3) Set your friendly name in presence before doing document work:',
       `   POST ${presenceUrl}`,
+      '   headers: x-share-token and X-Agent-Id',
       '   body: {"agentId":"<your-agent-id>","name":"<your-name>","status":"active"}',
-      '3) If edits/comments are useful based on state, apply them with:',
+      '4) If you need to insert or append a Markdown blob, use the Markdown import endpoint first:',
+      `   POST ${markdownUrl}`,
+      '   body: {"mode":"append","markdown":"## New section\\n\\nDraft text","by":"<your-agent-id>"}',
+      '5) If comments, flags, suggestions, or surgical block edits are useful based on state, apply them with:',
       `   POST ${opsUrl}`,
-      `   or POST ${editUrl}`,
-      '4) Then reply briefly with what you changed or suggest next steps.',
+      `   or POST ${editV2Url}`,
+      '6) Then reply briefly with what you changed, what you intentionally did not change, and any recommended next step.',
     ].join('\n');
   }
 
@@ -4086,7 +5384,7 @@ class ProofEditorImpl implements ProofEditor {
         backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
       `;
 
-      const addItem = (title: string, onSelect: (itemLabel: HTMLSpanElement) => Promise<boolean> | boolean, opts?: { subtle?: boolean; disabled?: boolean }) => {
+      const addItem = (title: string, onSelect: (itemLabel: HTMLSpanElement) => Promise<boolean> | boolean, opts?: { subtle?: boolean; disabled?: boolean; successText?: string; failureText?: string }) => {
         const item = document.createElement('button');
         item.type = 'button';
         item.setAttribute('role', 'menuitem');
@@ -4114,7 +5412,7 @@ class ProofEditorImpl implements ProofEditor {
         item.onclick = async () => {
           if (opts?.disabled) return;
           const ok = await onSelect(left);
-          right.textContent = ok ? 'Copied' : 'Failed';
+          right.textContent = ok ? (opts?.successText ?? 'Copied') : (opts?.failureText ?? 'Failed');
           if (ok) {
             setTimeout(() => cleanup(), 700);
           } else {
@@ -4164,8 +5462,10 @@ class ProofEditorImpl implements ProofEditor {
       };
 
       addItem('Copy link', async () => this.copyLinkWithFallback(this.getCanonicalShareUrl()));
+      addItem('Download Markdown', async () => this.downloadMarkdownFromShare(), { successText: 'Downloaded' });
       addDivider();
-      addActionItem('View activity', () => this.openShareActivityModal());
+      addActionItem('Review items', () => this.openReviewItemsModal());
+      addActionItem('Change history', () => this.openShareActivityModal());
 
       container.appendChild(menu);
       this.clampMenuToViewport(menu);
@@ -4321,12 +5621,12 @@ class ProofEditorImpl implements ProofEditor {
     btn.className = 'share-pill-agent-trigger';
     if (hasAgents) {
       btn.classList.add('has-agents');
-      btn.setAttribute('aria-label', `${agents.length} agent collaborator${agents.length === 1 ? '' : 's'}. Open actions`);
+      btn.setAttribute('aria-label', `${agents.length} agent collaborator${agents.length === 1 ? '' : 's'}. Open agent invite and management actions`);
       btn.setAttribute('aria-haspopup', 'menu');
       btn.setAttribute('aria-expanded', 'false');
       btn.style.cssText = `
-        display:inline-flex;align-items:center;justify-content:center;gap:0;min-height:44px;min-width:44px;padding:0 4px;
-        background:transparent;border:0;border-radius:18px;color:#111827;cursor:pointer;
+        display:inline-flex;align-items:center;justify-content:center;gap:8px;min-height:44px;min-width:44px;padding:0 12px;
+        background:rgba(255,255,255,0.76);border:1px solid rgba(17,24,39,0.10);border-radius:22px;color:#111827;cursor:pointer;
         transition:background 0.15s;flex-shrink:0;font-family:inherit;
       `;
 
@@ -4352,11 +5652,20 @@ class ProofEditorImpl implements ProofEditor {
       wrap.dataset.agentCount = String(agents.length);
 
       btn.appendChild(wrap);
+
+      const label = document.createElement('span');
+      label.className = 'agent-btn-label';
+      label.textContent = 'Agents';
+      label.style.cssText = 'font-size:12px;font-weight:700;line-height:1;color:#111827;';
+      btn.appendChild(label);
+
       btn.onmouseenter = () => {
-        btn.style.background = 'rgba(17,24,39,0.06)';
+        btn.style.background = '#fff';
+        btn.style.borderColor = 'rgba(17,24,39,0.20)';
       };
       btn.onmouseleave = () => {
-        btn.style.background = 'transparent';
+        btn.style.background = 'rgba(255,255,255,0.76)';
+        btn.style.borderColor = 'rgba(17,24,39,0.10)';
       };
     } else {
       btn.setAttribute('aria-label', 'Add agent');
@@ -4465,10 +5774,10 @@ class ProofEditorImpl implements ProofEditor {
         header.textContent = 'Add an agent';
         header.style.cssText = 'padding:8px 12px 4px;color:#fff;font-size:13px;font-weight:700;';
         const body = document.createElement('div');
-        body.textContent = 'Invite an agent collaborator to edit, suggest, and review this doc.';
+        body.textContent = 'Invite an agent collaborator with this doc link, API access, and the HandBrake rules of the road.';
         body.style.cssText = 'padding:0 12px 8px;color:rgba(255,255,255,0.78);font-size:12px;line-height:1.35;';
         menu.append(header, body);
-        addMenuButton('Copy agent invite link', async () => this.copyAgentInviteWithFallback(), {
+        addMenuButton('Copy agent instructions', async () => this.copyAgentInviteWithFallback(), {
           successText: 'Copied',
         });
         addDivider();
@@ -4545,7 +5854,7 @@ class ProofEditorImpl implements ProofEditor {
           menu.appendChild(row);
         }
         addDivider();
-        addMenuButton('Copy agent invite link', async () => this.copyAgentInviteWithFallback(), {
+        addMenuButton('Copy agent instructions', async () => this.copyAgentInviteWithFallback(), {
           successText: 'Copied',
         });
       }
@@ -4861,6 +6170,8 @@ class ProofEditorImpl implements ProofEditor {
   }
 
   private applyTopChromeForMode(): void {
+    document.body.dataset.shareMode = this.isShareMode ? 'true' : 'false';
+
     const toolbar = document.getElementById('toolbar');
     if (toolbar) {
       if (this.isShareMode) {
@@ -4890,6 +6201,7 @@ class ProofEditorImpl implements ProofEditor {
 
     if (banners.length === 0) {
       editor.style.paddingTop = '';
+      document.documentElement.style.removeProperty('--section-navigator-top');
       return;
     }
 
@@ -4900,6 +6212,7 @@ class ProofEditorImpl implements ProofEditor {
       offset += height;
     }
 
+    document.documentElement.style.setProperty('--section-navigator-top', `${Math.ceil(offset + 12)}px`);
     const extraSpacing = 32;
     editor.style.paddingTop = `${Math.ceil(offset + extraSpacing)}px`;
   }
@@ -4913,6 +6226,7 @@ class ProofEditorImpl implements ProofEditor {
       view.setProps({
         editable: () => isEditable,
       });
+      this.updateTypeToolbarState(view);
     };
 
     if (viewOverride) {
@@ -5083,8 +6397,10 @@ class ProofEditorImpl implements ProofEditor {
     this.editor.action((ctx) => {
       const view = ctx.get(editorViewCtx);
       const dom = view.dom;
+      let pointerDownPoint: { x: number; y: number } | null = null;
 
       const reportCursor = () => {
+        this.noteLocalSelectionActivity();
         if (cursorTimeout) clearTimeout(cursorTimeout);
         cursorTimeout = setTimeout(() => {
           void view.state.selection.from;
@@ -5105,25 +6421,117 @@ class ProofEditorImpl implements ProofEditor {
         this.reportEditorInputActivity('input');
       };
 
+      const shouldHandleEditorPointer = (event: MouseEvent): boolean => {
+        if (event.button !== 0) return false;
+        if (event.defaultPrevented) return false;
+        if (event.metaKey || event.ctrlKey || event.altKey) return false;
+        const target = event.target;
+        if (!(target instanceof Node)) return false;
+        if (!dom.contains(target)) return false;
+        if (target instanceof Element) {
+          if (target.closest('[data-mark-id], [contenteditable="false"], button, a, input, textarea, select')) return false;
+        }
+        return true;
+      };
+
+      const syncPointerCaret = (event: MouseEvent) => {
+        if (!shouldHandleEditorPointer(event)) return;
+        const start = pointerDownPoint;
+        pointerDownPoint = null;
+        if (!start) return;
+
+        const dx = Math.abs(event.clientX - start.x);
+        const dy = Math.abs(event.clientY - start.y);
+        if (dx > 5 || dy > 5) return;
+
+        const point = { left: event.clientX, top: event.clientY };
+        window.setTimeout(() => {
+          const targetAtPoint = document.elementFromPoint(event.clientX, event.clientY);
+          if (!targetAtPoint || !dom.contains(targetAtPoint)) return;
+          if (targetAtPoint.closest('[data-mark-id], [contenteditable="false"], button, a, input, textarea, select')) return;
+
+          const domSelection = window.getSelection();
+          if (domSelection && !domSelection.isCollapsed && domSelection.toString().trim().length > 0) return;
+
+          const resolved = view.posAtCoords(point);
+          if (!resolved) return;
+
+          try {
+            const $pos = view.state.doc.resolve(resolved.pos);
+            if (!$pos.parent.isTextblock) return;
+            const selection = TextSelection.create(view.state.doc, resolved.pos);
+            if (selection.eq(view.state.selection)) {
+              view.focus();
+              return;
+            }
+            view.dispatch(
+              view.state.tr
+                .setSelection(selection)
+                .setMeta('proof-local-pointer-selection', true)
+                .setMeta('addToHistory', false),
+            );
+            view.focus();
+            this.noteLocalSelectionActivity();
+          } catch {
+            // Ignore coordinate mapping failures; default browser selection still applies.
+          }
+        }, 0);
+      };
+
+      const rememberPointerDown = (event: MouseEvent) => {
+        reportCursor();
+        if (!shouldHandleEditorPointer(event)) {
+          pointerDownPoint = null;
+          return;
+        }
+        pointerDownPoint = { x: event.clientX, y: event.clientY };
+      };
+
       dom.addEventListener('keyup', reportKeyboardActivity);
+      dom.addEventListener('pointerdown', rememberPointerDown);
+      dom.addEventListener('mousedown', rememberPointerDown);
       dom.addEventListener('beforeinput', reportInputActivity);
       dom.addEventListener('paste', reportInputActivity);
       dom.addEventListener('drop', reportInputActivity);
       dom.addEventListener('compositionend', reportInputActivity);
-      dom.addEventListener('mouseup', reportCursor);
+      dom.addEventListener('mouseup', syncPointerCaret);
+      dom.addEventListener('focusin', reportCursor);
     });
   }
 
   private reportEditorInputActivity(source: 'keyboard' | 'input'): void {
     const now = Date.now();
     this.lastLocalTypingAt = now;
+    this.lastLocalSelectionActivityAt = now;
     if (now - this.lastEditorInputActivitySentAt < 500) return;
     this.lastEditorInputActivitySentAt = now;
     void source;
   }
 
+  private noteLocalSelectionActivity(): void {
+    this.lastLocalSelectionActivityAt = Date.now();
+  }
+
+  private hasRecentLocalSelectionActivity(): boolean {
+    return (Date.now() - this.lastLocalSelectionActivityAt) < this.localSelectionOwnershipWindowMs;
+  }
+
+  private isUsefulSelectionSnapshot(snapshot: LocalSelectionSnapshot | null): snapshot is LocalSelectionSnapshot {
+    return Boolean(snapshot && (snapshot.from > 3 || snapshot.to > 3));
+  }
+
+  private capturePendingCollabRebindSelection(view: EditorView): void {
+    if (!this.isShareMode || !this.collabEnabled) return;
+    if (!view.hasFocus() && !this.hasRecentLocalSelectionActivity()) return;
+    const snapshot = this.captureLocalSelectionSnapshot(view);
+    if (!this.isUsefulSelectionSnapshot(snapshot)) return;
+    this.pendingCollabRebindSelectionSnapshot = snapshot;
+  }
+
   private noteLocalContentMutation(): void {
-    this.lastLocalTypingAt = Date.now();
+    const now = Date.now();
+    this.lastLocalTypingAt = now;
+    this.lastLocalSelectionActivityAt = now;
   }
 
   private isYjsChangeOriginTransaction(transaction: any): boolean {
@@ -5143,48 +6551,319 @@ class ProofEditorImpl implements ProofEditor {
     return false;
   }
 
+  private captureLocalSelectionSnapshot(view: EditorView): LocalSelectionSnapshot {
+    const { selection } = view.state;
+    const snapshot: LocalSelectionSnapshot = {
+      bookmark: typeof selection.getBookmark === 'function' ? selection.getBookmark() : null,
+      from: selection.from,
+      to: selection.to,
+      anchor: selection.anchor,
+      head: selection.head,
+      scrollY: window.scrollY,
+      relativeAnchor: null,
+      relativeHead: null,
+    };
+
+    try {
+      const ystate = (ySyncPluginKey.getState(view.state) as any) ?? null;
+      const binding = ystate?.binding;
+      const type = binding?.type;
+      const mapping = binding?.mapping;
+      if (type && mapping) {
+        snapshot.relativeAnchor = absolutePositionToRelativePosition(selection.anchor, type, mapping);
+        snapshot.relativeHead = absolutePositionToRelativePosition(selection.head, type, mapping);
+      }
+    } catch {
+      // Relative positions are best-effort. The bookmark/absolute fallbacks still protect the local cursor.
+    }
+
+    return snapshot;
+  }
+
+  private resolveRelativeSelectionSnapshot(
+    view: EditorView,
+    snapshot: LocalSelectionSnapshot,
+  ): TextSelection | null {
+    if (!snapshot.relativeAnchor || !snapshot.relativeHead) return null;
+
+    try {
+      const ystate = (ySyncPluginKey.getState(view.state) as any) ?? null;
+      const binding = ystate?.binding;
+      const doc = binding?.doc;
+      const type = binding?.type;
+      const mapping = binding?.mapping;
+      if (!doc || !type || !mapping) return null;
+
+      const anchor = relativePositionToAbsolutePosition(doc, type, snapshot.relativeAnchor, mapping);
+      const head = relativePositionToAbsolutePosition(doc, type, snapshot.relativeHead, mapping);
+      if (anchor === null || head === null) return null;
+
+      return this.createTextSelectionFromPositions(view, anchor, head);
+    } catch {
+      return null;
+    }
+  }
+
+  private resolveBookmarkSelectionSnapshot(
+    view: EditorView,
+    sourceTransaction: any,
+    snapshot: LocalSelectionSnapshot,
+  ): TextSelection | null {
+    if (!snapshot.bookmark || typeof snapshot.bookmark.resolve !== 'function') return null;
+
+    try {
+      const mapping = sourceTransaction?.mapping;
+      const mappedBookmark = mapping && typeof snapshot.bookmark.map === 'function'
+        ? snapshot.bookmark.map(mapping)
+        : snapshot.bookmark;
+      const selection = mappedBookmark.resolve(view.state.doc);
+      return selection instanceof TextSelection ? selection : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private resolveAbsoluteSelectionSnapshot(
+    view: EditorView,
+    snapshot: LocalSelectionSnapshot,
+  ): TextSelection | null {
+    try {
+      return this.createTextSelectionFromPositions(view, snapshot.anchor, snapshot.head);
+    } catch {
+      return null;
+    }
+  }
+
+  private createTextSelectionFromPositions(view: EditorView, anchor: number, head: number): TextSelection {
+    const docSize = view.state.doc.content.size;
+    const clampedAnchor = Math.max(0, Math.min(anchor, docSize));
+    const clampedHead = Math.max(0, Math.min(head, docSize));
+    return TextSelection.between(
+      view.state.doc.resolve(clampedAnchor),
+      view.state.doc.resolve(clampedHead),
+    );
+  }
+
+  private selectionAppearsAtDocumentStart(
+    selection: { from: number; to: number } | null,
+    snapshot: LocalSelectionSnapshot,
+  ): boolean {
+    return Boolean(selection && snapshot.from > 3 && selection.from <= 3);
+  }
+
+  private resolveStableLocalSelection(
+    view: EditorView,
+    sourceTransaction: any,
+    snapshot: LocalSelectionSnapshot,
+  ): TextSelection | null {
+    const relativeSelection = this.resolveRelativeSelectionSnapshot(view, snapshot);
+    if (relativeSelection && !this.selectionAppearsAtDocumentStart(relativeSelection, snapshot)) {
+      return relativeSelection;
+    }
+
+    const bookmarkSelection = this.resolveBookmarkSelectionSnapshot(view, sourceTransaction, snapshot);
+    if (bookmarkSelection && !this.selectionAppearsAtDocumentStart(bookmarkSelection, snapshot)) {
+      return bookmarkSelection;
+    }
+
+    return this.resolveAbsoluteSelectionSnapshot(view, snapshot);
+  }
+
   private stabilizeCursorAfterRemoteYjsTransaction(
     view: EditorView,
     sourceTransaction: any,
-    beforeSelectionFrom: number,
-    beforeSelectionEmpty: boolean,
+    beforeSelection: LocalSelectionSnapshot,
+    localSelectionOwnedBeforeDispatch: boolean,
     dispatchBase: (transaction: any) => void,
   ): void {
     if (!this.isShareMode || !this.collabEnabled) return;
-    if (!beforeSelectionEmpty || !view.state.selection.empty) return;
-    if (!view.hasFocus()) return;
-
+    if (!localSelectionOwnedBeforeDispatch) return;
     if (!this.isYjsChangeOriginTransaction(sourceTransaction)) return;
 
-    if ((Date.now() - this.lastLocalTypingAt) > this.remoteCursorStabilityWindowMs) return;
-
-    let mappedCursor = beforeSelectionFrom;
-    const mapping = sourceTransaction?.mapping;
-    if (mapping && typeof mapping.map === 'function') {
-      try {
-        mappedCursor = mapping.map(beforeSelectionFrom, 1);
-      } catch {
-        mappedCursor = beforeSelectionFrom;
-      }
-    }
-
-    const docSize = view.state.doc.content.size;
-    const targetPos = Math.max(0, Math.min(mappedCursor, docSize));
-    const currentPos = view.state.selection.from;
-    if (targetPos <= currentPos) return;
-
     try {
-      // @ts-expect-error - TextSelection is available at runtime
-      const TextSelection = view.state.selection.constructor;
-      const $target = view.state.doc.resolve(targetPos);
-      const stabilizedSelection = TextSelection.near($target, 1);
+      const currentSelection = view.state.selection;
+      // y-prosemirror's sync plugin captures the relative selection BEFORE applying remote
+      // updates and restores it via tr.setSelection inside the transaction we just dispatched.
+      // ProseMirror's mapping then keeps the caret coherent for ordinary remote inserts/deletes.
+      // We must NOT re-derive a selection from a snapshot taken at dispatch-time — by that point
+      // the binding's mapping has already been rebuilt for the new doc, so the snapshot's anchor
+      // (still the pre-tx absolute pos) and the post-tx mapping are out of sync. Re-applying that
+      // snapshot drags the caret backward by the size of every remote insert that landed before it.
+      // The safety net here is only meant to catch true snaps to the document top — anything else
+      // is either correct or close enough to leave alone.
+      if (currentSelection.from > 3) {
+        this.restoreScrollAfterRemoteYjsTransaction(beforeSelection.scrollY);
+        return;
+      }
+      if (beforeSelection.from <= 3) {
+        this.restoreScrollAfterRemoteYjsTransaction(beforeSelection.scrollY);
+        return;
+      }
+      const selectionSnapshot = this.isUsefulSelectionSnapshot(this.pendingCollabRebindSelectionSnapshot)
+        ? this.pendingCollabRebindSelectionSnapshot
+        : beforeSelection;
+      const stabilizedSelection = this.resolveStableLocalSelection(view, sourceTransaction, selectionSnapshot);
+      if (!stabilizedSelection || typeof stabilizedSelection.eq !== 'function') return;
+      if (this.selectionAppearsAtDocumentStart(stabilizedSelection, selectionSnapshot)) return;
+      if (!this.shouldRestoreLocalSelectionAfterRemoteChange(currentSelection, stabilizedSelection, selectionSnapshot.from)) {
+        this.restoreScrollAfterRemoteYjsTransaction(beforeSelection.scrollY);
+        return;
+      }
       const stabilizeTr = view.state.tr
         .setSelection(stabilizedSelection)
+        .setMeta('proof-local-selection-restore', true)
         .setMeta('addToHistory', false);
       dispatchBase(stabilizeTr);
+      this.pendingCollabRebindSelectionSnapshot = null;
+      this.restoreScrollAfterRemoteYjsTransaction(selectionSnapshot.scrollY);
     } catch {
       // Ignore selection stabilization failures; never break the primary transaction.
     }
+  }
+
+  private isCursorDisplacingSystemTransaction(transaction: any): boolean {
+    if (!transaction) return false;
+    if (transaction.getMeta?.('proof-local-selection-restore') === true) return false;
+    if (transaction.getMeta?.('proof-local-pointer-selection') === true) return false;
+    if (this.isYjsChangeOriginTransaction(transaction)) return false;
+    return transaction.getMeta?.('document-load') !== undefined
+      || transaction.getMeta?.(marksPluginKey) !== undefined;
+  }
+
+  private stabilizeCursorAfterSystemTransaction(
+    view: EditorView,
+    sourceTransaction: any,
+    beforeSelection: LocalSelectionSnapshot,
+    localSelectionOwnedBeforeDispatch: boolean,
+    dispatchBase: (transaction: any) => void,
+  ): void {
+    if (!this.isShareMode || !this.collabEnabled) return;
+    if (!localSelectionOwnedBeforeDispatch) return;
+    if (!this.isCursorDisplacingSystemTransaction(sourceTransaction)) return;
+
+    try {
+      const selectionSnapshot = this.isUsefulSelectionSnapshot(this.pendingCollabRebindSelectionSnapshot)
+        ? this.pendingCollabRebindSelectionSnapshot
+        : beforeSelection;
+      if (!this.isUsefulSelectionSnapshot(selectionSnapshot)) return;
+
+      const stabilizedSelection = this.resolveStableLocalSelection(view, sourceTransaction, selectionSnapshot);
+      if (!stabilizedSelection || typeof stabilizedSelection.eq !== 'function') return;
+      if (this.selectionAppearsAtDocumentStart(stabilizedSelection, selectionSnapshot)) return;
+
+      const currentSelection = view.state.selection;
+      if (!this.shouldRestoreLocalSelectionAfterRemoteChange(currentSelection, stabilizedSelection, selectionSnapshot.from)) {
+        this.restoreScrollAfterRemoteYjsTransaction(selectionSnapshot.scrollY);
+        return;
+      }
+
+      const stabilizeTr = view.state.tr
+        .setSelection(stabilizedSelection)
+        .setMeta('proof-local-selection-restore', true)
+        .setMeta('addToHistory', false);
+      dispatchBase(stabilizeTr);
+      this.pendingCollabRebindSelectionSnapshot = null;
+      this.restoreScrollAfterRemoteYjsTransaction(selectionSnapshot.scrollY);
+    } catch {
+      // Ignore selection stabilization failures; never break system document updates.
+    }
+  }
+
+  private stabilizeCursorAfterUnexpectedSelectionSnap(
+    view: EditorView,
+    sourceTransaction: any,
+    beforeSelection: LocalSelectionSnapshot,
+    localSelectionOwnedBeforeDispatch: boolean,
+    dispatchBase: (transaction: any) => void,
+  ): void {
+    if (!this.isShareMode || !this.collabEnabled) return;
+    if (!localSelectionOwnedBeforeDispatch) return;
+    if (!sourceTransaction?.docChanged) return;
+    if (sourceTransaction.getMeta?.('proof-local-selection-restore') === true) return;
+    if (sourceTransaction.getMeta?.('proof-local-pointer-selection') === true) return;
+    if (!this.isUsefulSelectionSnapshot(beforeSelection)) return;
+
+    const likelyNonUserChange = this.isYjsChangeOriginTransaction(sourceTransaction)
+      || this.isCursorDisplacingSystemTransaction(sourceTransaction)
+      || sourceTransaction.getMeta?.('addToHistory') === false;
+    if (!likelyNonUserChange) return;
+
+    const currentSelection = view.state.selection;
+    const snappedToDocumentStart = beforeSelection.from > 3 && currentSelection.from <= 3;
+    // Originally we also restored on any "jumped far away" delta (>1000 chars), on
+    // the theory that any transaction that moved the caret that much was a bug.
+    // That heuristic was wrong: a legitimate large remote insert (e.g. an agent
+    // pasting an entire section, or another human pasting a long block of text)
+    // moves y-prosemirror's correctly-mapped caret by exactly the inserted length.
+    // Reverting to `beforeSelection` in that case re-introduces the same stale-
+    // snapshot bug we already fixed for ordinary inserts: the caret jumps backward
+    // into freshly-inserted remote content. We now only treat far jumps as
+    // anomalies when the caret ALSO landed at the top of the doc (≤3) — the
+    // recognizable "snap to top-left" failure we actually want to catch.
+    const jumpedFarAwayAndSnappedToStart = Math.abs(currentSelection.from - beforeSelection.from) > 1000
+      && currentSelection.from <= 3;
+    if (!snappedToDocumentStart && !jumpedFarAwayAndSnappedToStart) return;
+
+    try {
+      const stabilizedSelection = this.resolveStableLocalSelection(view, sourceTransaction, beforeSelection);
+      if (!stabilizedSelection || typeof stabilizedSelection.eq !== 'function') return;
+      if (this.selectionAppearsAtDocumentStart(stabilizedSelection, beforeSelection)) return;
+      if (!this.shouldRestoreLocalSelectionAfterRemoteChange(currentSelection, stabilizedSelection, beforeSelection.from)) {
+        this.restoreScrollAfterRemoteYjsTransaction(beforeSelection.scrollY);
+        return;
+      }
+      const stabilizeTr = view.state.tr
+        .setSelection(stabilizedSelection)
+        .setMeta('proof-local-selection-restore', true)
+        .setMeta('addToHistory', false);
+      dispatchBase(stabilizeTr);
+      this.restoreScrollAfterRemoteYjsTransaction(beforeSelection.scrollY);
+    } catch {
+      // This is a last-line guardrail; never break the primary transaction.
+    }
+  }
+
+  private restorePendingCollabRebindSelection(view: EditorView): boolean {
+    const snapshot = this.pendingCollabRebindSelectionSnapshot;
+    if (!this.isUsefulSelectionSnapshot(snapshot)) return false;
+
+    try {
+      const selection = this.resolveStableLocalSelection(view, null, snapshot);
+      if (!selection || this.selectionAppearsAtDocumentStart(selection, snapshot)) return false;
+      if (!this.shouldRestoreLocalSelectionAfterRemoteChange(view.state.selection, selection, snapshot.from)) {
+        this.pendingCollabRebindSelectionSnapshot = null;
+        return false;
+      }
+      view.dispatch(
+        view.state.tr
+          .setSelection(selection)
+          .setMeta('proof-local-selection-restore', true)
+          .setMeta('addToHistory', false),
+      );
+      this.pendingCollabRebindSelectionSnapshot = null;
+      this.restoreScrollAfterRemoteYjsTransaction(snapshot.scrollY);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private shouldRestoreLocalSelectionAfterRemoteChange(
+    currentSelection: { from: number; to: number },
+    stabilizedSelection: { from: number; to: number; eq?: (other: unknown) => boolean },
+    beforeSelectionFrom: number,
+  ): boolean {
+    if (typeof stabilizedSelection.eq === 'function' && stabilizedSelection.eq(currentSelection)) return false;
+    if (beforeSelectionFrom <= 3 && stabilizedSelection.from <= 3) return false;
+    return true;
+  }
+
+  private restoreScrollAfterRemoteYjsTransaction(beforeScrollY: number): void {
+    if (!Number.isFinite(beforeScrollY)) return;
+    if (Math.abs(window.scrollY - beforeScrollY) < 24) return;
+    window.requestAnimationFrame(() => {
+      window.scrollTo({ top: beforeScrollY, left: window.scrollX, behavior: 'auto' });
+    });
   }
 
   /**
@@ -5208,8 +6887,9 @@ class ProofEditorImpl implements ProofEditor {
             this.revision += 1;
           }
         };
-        const beforeSelectionFrom = view.state.selection.from;
-        const beforeSelectionEmpty = view.state.selection.empty;
+        const beforeSelection = this.captureLocalSelectionSnapshot(view);
+        const hadFocusBeforeDispatch = view.hasFocus();
+        const localSelectionOwnedBeforeDispatch = hadFocusBeforeDispatch || this.hasRecentLocalSelectionActivity();
         const isRemoteContentChange = Boolean(tr?.docChanged) && this.isYjsChangeOriginTransaction(tr);
         const isMarksOnlyChange = tr?.getMeta?.(marksPluginKey) !== undefined;
         const isDocumentLoad = tr?.getMeta?.('document-load') !== undefined;
@@ -5242,18 +6922,39 @@ class ProofEditorImpl implements ProofEditor {
           // These are internal operations that should not be converted to suggestions
           if (tr.getMeta(marksPluginKey) !== undefined) {
             dispatchWithRevision(tr);
+            this.stabilizeCursorAfterSystemTransaction(
+              view,
+              tr,
+              beforeSelection,
+              localSelectionOwnedBeforeDispatch,
+              originalDispatch,
+            );
             return;
           }
 
           // Don't intercept document load transactions
           if (tr.getMeta('document-load') !== undefined) {
             dispatchWithRevision(tr);
+            this.stabilizeCursorAfterSystemTransaction(
+              view,
+              tr,
+              beforeSelection,
+              localSelectionOwnedBeforeDispatch,
+              originalDispatch,
+            );
             return;
           }
 
           // Don't intercept Yjs-origin collaborative transactions.
           if (this.isYjsChangeOriginTransaction(tr)) {
-            originalDispatch(tr);
+            dispatchWithRevision(tr);
+            this.stabilizeCursorAfterRemoteYjsTransaction(
+              view,
+              tr,
+              beforeSelection,
+              localSelectionOwnedBeforeDispatch,
+              originalDispatch,
+            );
             return;
           }
 
@@ -5273,8 +6974,22 @@ class ProofEditorImpl implements ProofEditor {
         this.stabilizeCursorAfterRemoteYjsTransaction(
           view,
           tr,
-          beforeSelectionFrom,
-          beforeSelectionEmpty,
+          beforeSelection,
+          localSelectionOwnedBeforeDispatch,
+          originalDispatch,
+        );
+        this.stabilizeCursorAfterSystemTransaction(
+          view,
+          tr,
+          beforeSelection,
+          localSelectionOwnedBeforeDispatch,
+          originalDispatch,
+        );
+        this.stabilizeCursorAfterUnexpectedSelectionSnap(
+          view,
+          tr,
+          beforeSelection,
+          localSelectionOwnedBeforeDispatch,
           originalDispatch,
         );
       };

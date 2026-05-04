@@ -80,7 +80,10 @@ export async function beginMutationReservation(args: {
     }
     return {
       kind: 'replay',
-      statusCode: 200,
+      // Replay the originally-stored status code rather than always 200. The
+      // body and the status must agree on whether the write actually applied,
+      // otherwise an agent on retry sees `2xx OK` while body says `success: false`.
+      statusCode: stored.statusCode,
       response: stored.response,
     };
   }

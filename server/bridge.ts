@@ -64,7 +64,6 @@ function parsePositiveIntEnv(name: string, fallback: number): number {
 async function resolveBridgeMutationBase(slug: string) {
   const resolved = await resolveAuthoritativeMutationBase(slug, {
     liveRequired: false,
-    preferProjection: false,
   });
   return resolved.ok ? resolved.base : null;
 }
@@ -127,9 +126,19 @@ function getSlugParam(req: Request): string | null {
 }
 
 function getBridgeToken(req: Request): string | null {
-  const headerToken = req.header('x-bridge-token');
-  if (typeof headerToken === 'string' && headerToken.trim()) {
-    return headerToken.trim();
+  // Accept any of the three credentials that callers may already be carrying:
+  //   x-bridge-token: typically the owner secret (legacy bridge default)
+  //   x-share-token:  the share access token from /documents/:slug or /share/markdown
+  //   Authorization: Bearer <token>: a normalized form of either of the above
+  // The bridge handler then resolves the role and checks editor/owner_bot.
+  const bridgeHeader = req.header('x-bridge-token');
+  if (typeof bridgeHeader === 'string' && bridgeHeader.trim()) {
+    return bridgeHeader.trim();
+  }
+
+  const shareHeader = req.header('x-share-token');
+  if (typeof shareHeader === 'string' && shareHeader.trim()) {
+    return shareHeader.trim();
   }
 
   const authHeader = req.header('authorization');
@@ -611,19 +620,25 @@ bridgeRouter.use(async (req: Request, res: Response) => {
       return;
     }
 
+    // Accept owner_bot OR editor for bridge mutations. Owner-only routes (resume,
+    // pause, revoke, delete) live elsewhere; the bridge surface here is editing,
+    // commenting, and suggestions — all of which an editor-role token should be
+    // able to do. Read paths and `auth: 'none'` policies short-circuit above.
     const token = getBridgeToken(req);
     const role = token ? resolveDocumentAccessRole(slug, token) : null;
-    if (role !== 'owner_bot') {
+    const allowed = role === 'owner_bot' || role === 'editor';
+    if (!allowed) {
       traceServerIncident({
         slug,
         subsystem: 'bridge',
         level: 'warn',
         eventType: 'auth.unauthorized',
-        message: 'Bridge request rejected due to missing or invalid owner token',
+        message: 'Bridge request rejected due to missing or insufficient access token',
         data: {
           method,
           path: bridgePath,
           tokenPresent: Boolean(token),
+          observedRole: role,
         },
       });
       res.status(401).json(buildUnauthorizedResponse(req, slug));
