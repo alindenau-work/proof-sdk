@@ -1,6 +1,7 @@
 import express from 'express';
 import { createServer } from 'http';
 import { WebSocketServer } from 'ws';
+import { networkInterfaces } from 'node:os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { apiRoutes } from './routes.js';
@@ -50,30 +51,58 @@ const LOCAL_DASHBOARD_REMOTE_HOSTS_ALLOWED = (() => {
 /**
  * Block remote callers from the dashboard surface. The /local/* routes have NO auth
  * checks: anyone who can reach them can list every document, mint a fresh editor
- * token for any of them, and delete any of them. Keeping that surface available to
- * the loopback interface is fine on a developer machine; exposing it to the LAN is
- * a catastrophe. The bind-host change above already prevents most of this exposure,
- * but if an operator opts into LAN binding they should still gate the dashboard
- * itself behind an explicit `PROOF_LOCAL_DASHBOARD_REMOTE_HOSTS=1` opt-in.
+ * token for any of them, and delete any of them. We allow same-machine callers
+ * (loopback OR any of this host's own network interface IPs) and reject everyone
+ * else, unless the operator explicitly opts in via PROOF_LOCAL_DASHBOARD_REMOTE_HOSTS=1.
+ *
+ * Why same-machine instead of loopback-only: when an operator binds to LAN
+ * (PROOF_HOST=0.0.0.0) so a teammate can reach share docs, the operator's own
+ * browser may resolve the dashboard via the LAN IP — which looks "remote" from
+ * the kernel's perspective even though the request is coming from the same
+ * physical machine. We compare the request's source IP against the host's own
+ * interface addresses to recognize that case without weakening the guard for
+ * actual remote callers.
  */
-function isLoopbackRequest(req: import('express').Request): boolean {
-  const ip = (req.ip || '').replace(/^::ffff:/, '');
-  if (ip === '127.0.0.1' || ip === '::1' || ip === 'localhost') return true;
-  // Some proxies forward `req.connection.remoteAddress` differently; check both.
-  const remote = ((req.socket as { remoteAddress?: string } | undefined)?.remoteAddress || '')
-    .replace(/^::ffff:/, '');
-  return remote === '127.0.0.1' || remote === '::1' || remote === 'localhost';
+function getOwnMachineAddresses(): Set<string> {
+  const addresses = new Set<string>(['127.0.0.1', '::1', 'localhost']);
+  try {
+    const interfaces = networkInterfaces();
+    for (const list of Object.values(interfaces)) {
+      if (!list) continue;
+      for (const entry of list) {
+        addresses.add(entry.address.replace(/^::ffff:/, ''));
+        addresses.add(entry.address);
+      }
+    }
+  } catch {
+    // networkInterfaces() can throw in restricted sandboxes; loopback fallback is fine.
+  }
+  return addresses;
+}
+
+function isSameMachineRequest(req: import('express').Request): boolean {
+  // Read the request's source IP from express + the underlying socket and check
+  // both against this machine's known interface addresses. We re-read the
+  // interface set on each request so that bringing up a new interface (e.g.
+  // joining a VPN) is picked up without a server restart.
+  const own = getOwnMachineAddresses();
+  const candidates = [
+    req.ip,
+    (req.socket as { remoteAddress?: string } | undefined)?.remoteAddress,
+  ].filter((value): value is string => typeof value === 'string' && value.length > 0)
+    .map((value) => value.replace(/^::ffff:/, ''));
+  return candidates.some((value) => own.has(value));
 }
 
 function localDashboardOnly(req: import('express').Request, res: import('express').Response, next: import('express').NextFunction): void {
-  if (LOCAL_DASHBOARD_REMOTE_HOSTS_ALLOWED || isLoopbackRequest(req)) {
+  if (LOCAL_DASHBOARD_REMOTE_HOSTS_ALLOWED || isSameMachineRequest(req)) {
     next();
     return;
   }
   res.status(403).json({
     success: false,
     code: 'LOCAL_DASHBOARD_FORBIDDEN',
-    error: 'The /local/* dashboard surface is restricted to loopback callers. Set PROOF_LOCAL_DASHBOARD_REMOTE_HOSTS=1 to opt into remote access.',
+    error: 'The /local/* dashboard surface is restricted to same-machine callers. Set PROOF_LOCAL_DASHBOARD_REMOTE_HOSTS=1 to opt into remote access.',
   });
 }
 const DEFAULT_ALLOWED_CORS_ORIGINS = [

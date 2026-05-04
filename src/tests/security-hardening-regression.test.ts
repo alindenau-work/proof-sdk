@@ -38,15 +38,21 @@ assert(
     && /app\.get\('\/local\/recent-documents',\s*localDashboardOnly/.test(indexSource)
     && /app\.post\('\/local\/documents\/:slug\/delete',\s*localDashboardOnly/.test(indexSource)
     && /app\.get\('\/local\/open\/:slug',\s*localDashboardOnly/.test(indexSource),
-  'Expected every /local/* route to be gated by the loopback-only middleware',
+  'Expected every /local/* route to be gated by the same-machine middleware',
 );
 assert(
   indexSource.includes('LOCAL_DASHBOARD_FORBIDDEN'),
-  'Expected the loopback-only middleware to reject remote callers with LOCAL_DASHBOARD_FORBIDDEN',
+  'Expected the same-machine middleware to reject remote callers with LOCAL_DASHBOARD_FORBIDDEN',
 );
 assert(
   indexSource.includes('PROOF_LOCAL_DASHBOARD_REMOTE_HOSTS'),
   'Expected an explicit env opt-in (PROOF_LOCAL_DASHBOARD_REMOTE_HOSTS) before the dashboard accepts remote callers',
+);
+assert(
+  indexSource.includes('isSameMachineRequest')
+    && indexSource.includes('networkInterfaces')
+    && indexSource.includes('getOwnMachineAddresses'),
+  'Expected the dashboard guard to recognize this host\'s own LAN addresses (not just loopback) so the operator can use the LAN URL on their own machine',
 );
 
 // Sec#2: bridge mutation policies require bridge-token, not 'none'.
